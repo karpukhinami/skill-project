@@ -1446,31 +1446,107 @@ def format_content_text(grouped: Dict, frp_structure: Dict) -> str:
     return '\n'.join(lines)
 
 def parse_llm_response(response_text: str, subject: str, class_num: str) -> List[Dict]:
-    """Парсит ответ от LLM и возвращает список записей."""
-    records = []
-    
-    # Пытаемся найти JSON в ответе
-    json_match = re.search(r'\{[\s\S]*\}', response_text)
-    if json_match:
+    """
+    Парсит ответ от LLM и возвращает список записей.
+    Обрабатывает: массивы [...], объекты {...}, markdown-блоки ```json```,
+    неполные/обрезанные JSON, лишний текст до и после.
+    """
+    def _extract_items(data):
+        """Извлекает список dict-записей из распарсенного объекта."""
+        items = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    items.append(item)
+        elif isinstance(data, dict):
+            # Словарь вида {"key": {...}, ...}
+            for value in data.values():
+                if isinstance(value, dict):
+                    items.append(value)
+                elif isinstance(value, list):
+                    for v in value:
+                        if isinstance(v, dict):
+                            items.append(v)
+        return items
+
+    def _add_meta(items):
+        for item in items:
+            item['subject'] = subject
+            item['class'] = class_num
+        return items
+
+    def _try_parse(text):
+        """Пробует json.loads; при ошибке пытается дописать недостающие закрывающие символы."""
+        text = text.strip()
         try:
-            data = json.loads(json_match.group())
-            if isinstance(data, dict):
-                # Если это словарь записей
-                for key, value in data.items():
-                    if isinstance(value, dict):
-                        value['subject'] = subject
-                        value['class'] = class_num
-                        records.append(value)
-            elif isinstance(data, list):
-                # Если это список записей
-                for item in data:
-                    if isinstance(item, dict):
-                        item['subject'] = subject
-                        item['class'] = class_num
-                        records.append(item)
+            return json.loads(text)
         except json.JSONDecodeError:
             pass
-    
+        # Дописываем недостающие ']' или '}'
+        for closing in (']', ']}', '}]', '}}', '"]', '"}', '"}]'):
+            try:
+                return json.loads(text + closing)
+            except json.JSONDecodeError:
+                pass
+        # Пробуем срезать текст до последней полной записи
+        # Ищем последнее }  перед которым можно закрыть массив
+        last_brace = text.rfind('},')
+        if last_brace == -1:
+            last_brace = text.rfind('}')
+        if last_brace > 0:
+            candidate = text[:last_brace + 1]
+            # Дополняем до массива или объекта
+            for wrap in ('', ']', '}'):
+                try:
+                    return json.loads(candidate + wrap)
+                except json.JSONDecodeError:
+                    pass
+        return None
+
+    records = []
+    text = response_text.strip()
+
+    # 1. Убираем markdown-обёртку ```json ... ``` или просто ``` ... ```
+    if '```' in text:
+        # Берём содержимое между первым и последним ```
+        parts = text.split('```')
+        # parts[0] — до первого ```, parts[1] — внутри, parts[2] — после
+        if len(parts) >= 3:
+            inner = parts[1]
+            # Убираем метку языка в первой строке (json, python и т.п.)
+            lines = inner.split('\n')
+            if lines and lines[0].strip().lower() in ('json', 'python', ''):
+                inner = '\n'.join(lines[1:])
+            text = inner.strip()
+        # Если блоков несколько — берём самый длинный
+        elif len(parts) >= 2:
+            text = max(parts, key=len).strip()
+
+    # 2. Сначала ищем массив [...]
+    arr_match = re.search(r'\[[\s\S]*\]', text)
+    if arr_match:
+        data = _try_parse(arr_match.group())
+        if data is not None:
+            items = _extract_items(data)
+            if items:
+                return _add_meta(items)
+
+    # 3. Ищем объект {...}
+    obj_match = re.search(r'\{[\s\S]*\}', text)
+    if obj_match:
+        data = _try_parse(obj_match.group())
+        if data is not None:
+            items = _extract_items(data)
+            if items:
+                return _add_meta(items)
+
+    # 4. Пробуем весь текст целиком (на случай если нет лишних символов)
+    data = _try_parse(text)
+    if data is not None:
+        items = _extract_items(data)
+        if items:
+            return _add_meta(items)
+
     return records
 
 # --- UI ---
