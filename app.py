@@ -3038,7 +3038,7 @@ elif mode == 'json_compare':
 elif mode == 'llm_structure':
     st.header("🤖 Структурирование содержания с помощью LLM")
     st.caption("Загрузите JSON файл с элементами содержания. Модель предложит логичное разделение на разделы и темы.")
-    
+
     # Инициализация session_state для LLM режима
     if 'llm_content_data' not in st.session_state:
         st.session_state.llm_content_data = None
@@ -3049,42 +3049,133 @@ elif mode == 'llm_structure':
     if 'llm_formatted_text' not in st.session_state:
         st.session_state.llm_formatted_text = None
     if 'llm_results' not in st.session_state:
-        st.session_state.llm_results = {}  # {subject_class: [records]}
+        st.session_state.llm_results = {}  # {pair_key: [records]}
     if 'llm_prompt_template' not in st.session_state:
-        st.session_state.llm_prompt_template = """Изучи представленные элементы содержания и предложи логичное разделение на разделы и темы внутри разделов.
-
-Для каждого элемента содержания верни запись в формате JSON со следующими полями:
+        st.session_state.llm_prompt_template = """Изучи представленные элементы содержания из ФРП (федеральная рабочая программа) и предложи логичное разделение на разделы и темы внутри разделов, опираясь на все доступные элементы содержания. Твои разделы и темы должны полностью покрывать все элементы, однако не обязательно повторять названия тех разделов и тем, которые представлены сейчас. Ты можешь объединять или разделять разделы и темы, как считаешь логичным. В пределах темы элементы содержания обязательно должны быть логично связаны; существенно разные элементы содержания не должны оказаться в одной теме.
+Составь список разделов и тем внутри каждого раздела, оформи этот список в формате JSON со следующими полями:
 - "section": название раздела, который ты предлагаешь
-- "frp_section": название раздела из ФРП, внутри которого должен быть расположен этот раздел (если возможно определить, иначе пустая строка)
-- "topic": название темы внутри этого раздела
+- "frp_section": название раздела из ФРП, внутри которого должен быть расположен этот раздел, или просто сам раздел ФРП, если ты считаешь, что название было подходящим (если соответствие невозможно, оставляй пустым)
+- "topic": название темы внутри этого раздела, который ты предлагаешь
 - "frp_topic": похожая/такая же/более охватывающая тема из ФРП (если есть, иначе пустая строка)
 
-Верни результат в формате JSON массива объектов."""
+Верни результат в формате JSON массива объектов без посторонних символов и своих комментариев."""
     if 'llm_custom_prompt' not in st.session_state:
         st.session_state.llm_custom_prompt = None
-    
-    # Загрузка файла
+
+    def _build_pair_text(subject, class_num):
+        """Формирует текст запроса для одной пары предмет+класс."""
+        pair_text_lines = []
+        pair_text_lines.append(f"предмет: {subject}")
+        pair_text_lines.append(f"класс: {class_num}")
+
+        sections = st.session_state.llm_grouped_data[subject][class_num]
+
+        # Записи с разделом и темой
+        for section in sorted(sections.keys()):
+            if section == 'без раздела':
+                continue
+            topics = sections[section]
+            for topic in sorted(topics.keys()):
+                if topic == 'без темы':
+                    continue
+                pair_text_lines.append(f"раздел: {section}")
+                pair_text_lines.append(f"тема: {topic}")
+                processed_texts = []
+                for text in topics[topic]:
+                    text = text.strip()
+                    if text:
+                        if not text.rstrip().endswith(('.', '!', '?')):
+                            text = text.rstrip() + '.'
+                        processed_texts.append(text)
+                pair_text_lines.append(' '.join(processed_texts))
+                pair_text_lines.append("")
+
+        # Записи с разделом, но без темы
+        for section in sorted(sections.keys()):
+            if section == 'без раздела':
+                continue
+            if 'без темы' in sections[section]:
+                pair_text_lines.append(f"раздел: {section}")
+                pair_text_lines.append("тема: без темы")
+                processed_texts = []
+                for text in sections[section]['без темы']:
+                    text = text.strip()
+                    if text:
+                        if not text.rstrip().endswith(('.', '!', '?')):
+                            text = text.rstrip() + '.'
+                        processed_texts.append(text)
+                pair_text_lines.append(' '.join(processed_texts))
+                pair_text_lines.append("")
+
+        # Записи без раздела
+        if 'без раздела' in sections:
+            pair_text_lines.append("раздел: без раздела")
+            all_no_section = []
+            for topic_texts in sections['без раздела'].values():
+                all_no_section.extend(topic_texts)
+            if all_no_section:
+                processed_texts = []
+                for text in all_no_section:
+                    text = text.strip()
+                    if text:
+                        if not text.rstrip().endswith(('.', '!', '?')):
+                            text = text.rstrip() + '.'
+                        processed_texts.append(text)
+                pair_text_lines.append(' '.join(processed_texts))
+                pair_text_lines.append("")
+
+        pair_text = '\n'.join(pair_text_lines)
+
+        # Добавляем информацию о ФРП разделах в начало
+        if st.session_state.llm_frp_structure:
+            frp_info_lines = ["По фрп имеются следующие разделы и темы:"]
+            if subject in st.session_state.llm_frp_structure:
+                frp_sections_src = st.session_state.llm_frp_structure[subject]
+            else:
+                frp_sections_src = {}
+                for frp_sections in st.session_state.llm_frp_structure.values():
+                    frp_sections_src.update(frp_sections)
+            for sec, tops in frp_sections_src.items():
+                frp_info_lines.append(f"раздел: {sec}")
+                for top in tops:
+                    frp_info_lines.append(f"  {top}")
+            pair_text = '\n'.join(frp_info_lines) + '\n\n' + pair_text
+
+        return pair_text
+
+    def _records_from_editor(edited_df, original_records, subject, class_num):
+        """Возвращает список записей из отредактированного DataFrame."""
+        updated = []
+        for i, (_, row) in enumerate(edited_df.iterrows()):
+            if i < len(original_records):
+                base = original_records[i].copy()
+            else:
+                base = {'subject': subject, 'class': class_num, 'text': '', 'sources': ['llm_structure']}
+            base['section'] = str(row.get('Раздел', '')).strip()
+            base['frp_section'] = str(row.get('Раздел ФРП', '')).strip()
+            base['topic'] = str(row.get('Тема', '')).strip()
+            base['frp_topic'] = str(row.get('Тема ФРП', '')).strip()
+            updated.append(base)
+        return updated
+
+    # --- Загрузка файла ---
     uploaded_file = st.file_uploader("Загрузите JSON файл с элементами содержания", type=['json'], key='llm_upload')
-    
+
     if uploaded_file:
         try:
             data = json.loads(uploaded_file.read().decode('utf-8'))
-            
-            # Проверка, что это content
             sample_key = next(iter(data.keys()), '')
             if 'content' not in sample_key.lower():
                 st.error("❌ Ошибка: Загруженный файл не содержит элементы содержания (content). Проверьте формат файла.")
             else:
                 st.session_state.llm_content_data = data
                 st.success(f"✅ Файл загружен: {len(data)} записей")
-                
-                # Группировка данных
+
                 if st.button("📊 Подготовить данные для анализа", type="primary", key='llm_prepare'):
                     with st.spinner("Группировка данных..."):
                         grouped = group_content_by_structure(data)
                         frp_structure = get_frp_sections_and_topics(data)
                         formatted_text = format_content_text(grouped, frp_structure)
-                        
                         st.session_state.llm_grouped_data = grouped
                         st.session_state.llm_frp_structure = frp_structure
                         st.session_state.llm_formatted_text = formatted_text
@@ -3096,17 +3187,17 @@ elif mode == 'llm_structure':
             st.error(f"❌ Ошибка: {e}")
             import traceback
             st.code(traceback.format_exc())
-    
-    # Показ подготовленных данных
+
+    # --- Подготовленный текст и настройки ---
     if st.session_state.llm_formatted_text:
         st.subheader("Подготовленный текст для анализа")
         with st.expander("📝 Просмотр текста", expanded=False):
             st.text_area("Текст", value=st.session_state.llm_formatted_text, height=300, disabled=True, key='llm_text_view')
-        
+
         # Редактирование промпта
         if st.button("✏️ Редактировать промпт", key='llm_edit_prompt'):
             st.session_state.llm_show_prompt_editor = True
-        
+
         if st.session_state.get('llm_show_prompt_editor', False):
             st.subheader("Редактирование промпта")
             edited_prompt = st.text_area(
@@ -3127,261 +3218,188 @@ elif mode == 'llm_structure':
                     st.session_state.llm_custom_prompt = None
                     st.session_state.llm_show_prompt_editor = False
                     st.rerun()
-        
-        # Проверка API ключа
+
+        # --- Проверка API ключа ---
         api_key = get_claude_api_key()
         if not api_key:
             st.warning("⚠️ Для работы с LLM необходимо ввести API ключ Claude в боковой панели.")
         else:
-            # Обработка пачками (предмет + класс)
             if st.session_state.llm_grouped_data:
-                st.subheader("Обработка данных")
-                
-                # Получаем список пар предмет+класс
+                # Список пар предмет+класс
                 subject_class_pairs = []
                 for subject in sorted(st.session_state.llm_grouped_data.keys()):
-                    for class_num in sorted(st.session_state.llm_grouped_data[subject].keys(), 
-                                          key=lambda x: int(x) if str(x).isdigit() else 0):
+                    for class_num in sorted(
+                        st.session_state.llm_grouped_data[subject].keys(),
+                        key=lambda x: int(x) if str(x).isdigit() else 0
+                    ):
                         subject_class_pairs.append((subject, class_num))
-                
+
                 if subject_class_pairs:
-                    st.write(f"Найдено {len(subject_class_pairs)} пар предмет+класс для обработки")
-                    
-                    # Формируем текст для каждой пары
-                    for idx, (subject, class_num) in enumerate(subject_class_pairs):
-                        pair_key = f"{subject}_{class_num}"
-                        
-                        st.markdown(f"---")
-                        st.markdown(f"**{idx + 1}. Предмет: {subject}, Класс: {class_num}**")
-                        
-                        # Формируем текст для этой пары
-                        pair_text_lines = []
-                        pair_text_lines.append(f"предмет: {subject}")
-                        pair_text_lines.append(f"класс: {class_num}")
-                        
-                        sections = st.session_state.llm_grouped_data[subject][class_num]
-                        
-                        # Записи с разделом и темой
-                        for section in sorted(sections.keys()):
-                            if section == 'без раздела':
-                                continue
-                            topics = sections[section]
-                            for topic in sorted(topics.keys()):
-                                if topic == 'без темы':
+                    total_pairs = len(subject_class_pairs)
+                    done_pairs = sum(1 for s, c in subject_class_pairs if f"{s}_{c}" in st.session_state.llm_results)
+                    unprocessed = [(s, c) for s, c in subject_class_pairs if f"{s}_{c}" not in st.session_state.llm_results]
+
+                    st.subheader("Обработка данных")
+                    st.write(f"Групп предмет+класс: **{total_pairs}**, обработано: **{done_pairs}**")
+
+                    # --- Кнопка «Обработать все» ---
+                    if unprocessed:
+                        if st.button("🚀 Обработать все группы с помощью LLM", type="primary", key='llm_run_all'):
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            errors_list = []
+
+                            prompt = st.session_state.llm_custom_prompt or st.session_state.llm_prompt_template
+                            verify_ssl = st.session_state.get('claude_verify_ssl', True)
+                            model = st.session_state.get('claude_working_model', 'claude-sonnet-4-20250514')
+                            api_version = st.session_state.get('claude_working_api_version', '2023-06-01')
+
+                            for i, (subject, class_num) in enumerate(subject_class_pairs):
+                                pair_key = f"{subject}_{class_num}"
+                                if pair_key in st.session_state.llm_results:
+                                    progress_bar.progress((i + 1) / total_pairs)
                                     continue
-                                pair_text_lines.append(f"раздел: {section}")
-                                pair_text_lines.append(f"тема: {topic}")
-                                texts = topics[topic]
-                                # Обрабатываем каждую запись отдельно: добавляем точку, если её нет
-                                processed_texts = []
-                                for text in texts:
-                                    text = text.strip()
-                                    if text:
-                                        # Если не заканчивается точкой/восклицательным/вопросительным, добавляем точку
-                                        if not text.rstrip().endswith(('.', '!', '?')):
-                                            text = text.rstrip() + '.'
-                                        processed_texts.append(text)
-                                content_text = ' '.join(processed_texts)
-                                pair_text_lines.append(content_text)
-                                pair_text_lines.append("")
-                        
-                        # Записи с разделом, но без темы
-                        for section in sorted(sections.keys()):
-                            if section == 'без раздела':
-                                continue
-                            if 'без темы' in sections[section]:
-                                pair_text_lines.append(f"раздел: {section}")
-                                pair_text_lines.append("тема: без темы")
-                                texts = sections[section]['без темы']
-                                # Обрабатываем каждую запись отдельно: добавляем точку, если её нет
-                                processed_texts = []
-                                for text in texts:
-                                    text = text.strip()
-                                    if text:
-                                        # Если не заканчивается точкой/восклицательным/вопросительным, добавляем точку
-                                        if not text.rstrip().endswith(('.', '!', '?')):
-                                            text = text.rstrip() + '.'
-                                        processed_texts.append(text)
-                                content_text = ' '.join(processed_texts)
-                                pair_text_lines.append(content_text)
-                                pair_text_lines.append("")
-                        
-                        # Записи без раздела
-                        if 'без раздела' in sections:
-                            pair_text_lines.append("раздел: без раздела")
-                            all_no_section = []
-                            for topic_texts in sections['без раздела'].values():
-                                all_no_section.extend(topic_texts)
-                            if all_no_section:
-                                # Обрабатываем каждую запись отдельно: добавляем точку, если её нет
-                                processed_texts = []
-                                for text in all_no_section:
-                                    text = text.strip()
-                                    if text:
-                                        # Если не заканчивается точкой/восклицательным/вопросительным, добавляем точку
-                                        if not text.rstrip().endswith(('.', '!', '?')):
-                                            text = text.rstrip() + '.'
-                                        processed_texts.append(text)
-                                content_text = ' '.join(processed_texts)
-                                pair_text_lines.append(content_text)
-                                pair_text_lines.append("")
-                        
-                        pair_text = '\n'.join(pair_text_lines)
-                        
-                        # Добавляем информацию о ФРП разделах и темах для этого предмета в начало
-                        if st.session_state.llm_frp_structure and subject in st.session_state.llm_frp_structure:
-                            frp_info_lines = ["По фрп имеются следующие разделы и темы:"]
-                            for section, topics in st.session_state.llm_frp_structure[subject].items():
-                                frp_info_lines.append(f"раздел: {section}")
-                                for topic in topics:
-                                    frp_info_lines.append(f"  {topic}")
-                            frp_info_text = '\n'.join(frp_info_lines)
-                            pair_text = frp_info_text + '\n\n' + pair_text
-                        elif st.session_state.llm_frp_structure:
-                            # Если есть ФРП структура, но не для этого предмета, добавляем общую информацию
-                            frp_info_lines = ["По фрп имеются следующие разделы и темы:"]
-                            for frp_subject, sections in st.session_state.llm_frp_structure.items():
-                                for section, topics in sections.items():
-                                    frp_info_lines.append(f"раздел: {section}")
-                                    for topic in topics:
-                                        frp_info_lines.append(f"  {topic}")
-                            frp_info_text = '\n'.join(frp_info_lines)
-                            pair_text = frp_info_text + '\n\n' + pair_text
-                        
-                        # Проверяем, обработана ли уже эта пара
-                        if pair_key not in st.session_state.llm_results:
-                            with st.expander(f"📄 Текст для обработки ({subject}, {class_num})", expanded=False):
-                                st.text_area("", value=pair_text, height=200, disabled=True, key=f'llm_pair_text_{idx}')
-                            
-                            if st.button(f"🚀 Обработать с помощью LLM", key=f'llm_process_{idx}'):
-                                with st.spinner(f"Обработка {subject}, {class_num}..."):
-                                    prompt = st.session_state.llm_custom_prompt or st.session_state.llm_prompt_template
-                                    full_prompt = prompt + "\n\n" + pair_text
-                                    
-                                    messages = [{
-                                        "role": "user",
-                                        "content": full_prompt
-                                    }]
-                                    
-                                    verify_ssl = st.session_state.get('claude_verify_ssl', True)
-                                    # Используем сохраненные параметры из проверки ключа
-                                    model = st.session_state.get('claude_working_model', 'claude-sonnet-4-20250514')
-                                    api_version = st.session_state.get('claude_working_api_version', '2023-06-01')
-                                    response = call_claude_api(messages, api_key, model=model, api_version=api_version, verify_ssl=verify_ssl)
-                                    if response:
-                                        records = parse_llm_response(response, subject, class_num)
-                                        if records:
-                                            st.session_state.llm_results[pair_key] = records
-                                            st.success(f"✅ Обработано: {len(records)} записей")
-                                            st.rerun()
-                                        else:
-                                            st.error("Не удалось распарсить ответ модели. Проверьте формат ответа.")
-                                            st.text_area("Ответ модели:", value=response, height=200, key=f'llm_response_{idx}')
+
+                                status_text.write(
+                                    f"⏳ Обрабатываю: **{subject}**, класс **{class_num}** "
+                                    f"({i + 1}/{total_pairs})..."
+                                )
+
+                                pair_text = _build_pair_text(subject, class_num)
+                                full_prompt = prompt + "\n\n" + pair_text
+                                messages = [{"role": "user", "content": full_prompt}]
+
+                                response = call_claude_api(
+                                    messages, api_key,
+                                    model=model, api_version=api_version, verify_ssl=verify_ssl
+                                )
+
+                                if response:
+                                    records = parse_llm_response(response, subject, class_num)
+                                    if records:
+                                        st.session_state.llm_results[pair_key] = records
                                     else:
-                                        st.error("Ошибка при обращении к API")
-                        else:
-                            st.success(f"✅ Уже обработано: {len(st.session_state.llm_results[pair_key])} записей")
-                            
-                            # Показываем результаты в редактируемой таблице
-                            st.subheader(f"Результаты для {subject}, {class_num}")
+                                        errors_list.append(
+                                            f"Не удалось распарсить ответ для {subject}, {class_num}"
+                                        )
+                                        st.session_state.llm_results[pair_key] = []
+                                else:
+                                    errors_list.append(f"Ошибка API для {subject}, {class_num}")
+
+                                progress_bar.progress((i + 1) / total_pairs)
+
+                            status_text.empty()
+                            if errors_list:
+                                for err in errors_list:
+                                    st.error(err)
+                            else:
+                                st.success("✅ Все группы успешно обработаны!")
+                            st.rerun()
+                    else:
+                        st.success(f"✅ Все группы обработаны ({total_pairs})")
+                        if st.button("🔄 Сбросить и обработать заново", key='llm_rerun_all'):
+                            st.session_state.llm_results = {}
+                            st.rerun()
+
+                    # --- Отображение результатов ---
+                    if st.session_state.llm_results:
+                        st.markdown("---")
+                        st.subheader("📋 Результаты структурирования")
+
+                        # Словарь {pair_key: (edited_df, original_records, subject, class_num)}
+                        # заполняется по мере рендера таблиц; используется кнопками внизу
+                        all_edited = {}
+
+                        for idx, (subject, class_num) in enumerate(subject_class_pairs):
+                            pair_key = f"{subject}_{class_num}"
+                            if pair_key not in st.session_state.llm_results:
+                                continue
+
                             records = st.session_state.llm_results[pair_key]
-                            
-                            # Создаем DataFrame для редактирования
-                            # Группируем по разделам, чтобы дублировать название раздела
+
+                            st.subheader(f"📌 {subject} — {class_num} класс")
+
+                            if not records:
+                                st.warning("Нет данных (ошибка при обработке этой группы).")
+                                continue
+
                             df_data = []
-                            current_section = None
                             for i, rec in enumerate(records):
-                                section = rec.get('section', '')
-                                # Если раздел изменился, запоминаем его
-                                if section != current_section:
-                                    current_section = section
-                                
                                 df_data.append({
                                     '№': i + 1,
-                                    'Раздел': current_section or '',  # Всегда показываем раздел
-                                    'Раздел ФРП': rec.get('frp_section', ''),
+                                    'Раздел': rec.get('section', ''),
                                     'Тема': rec.get('topic', ''),
-                                    'Тема ФРП': rec.get('frp_topic', '')
+                                    'Раздел ФРП': rec.get('frp_section', ''),
+                                    'Тема ФРП': rec.get('frp_topic', ''),
                                 })
-                            
+
                             df = pd.DataFrame(df_data)
-                            
-                            # Редактируемая таблица
+
                             edited_df = st.data_editor(
                                 df,
                                 use_container_width=True,
-                                key=f'llm_editor_{idx}',
+                                key=f'llm_editor_{pair_key}',
                                 num_rows="dynamic",
                                 column_config={
+                                    '№': st.column_config.NumberColumn('№', width='small', disabled=True),
                                     'Раздел': st.column_config.TextColumn('Раздел', width='medium'),
-                                    'Раздел ФРП': st.column_config.TextColumn('Раздел ФРП', width='medium'),
                                     'Тема': st.column_config.TextColumn('Тема', width='medium'),
+                                    'Раздел ФРП': st.column_config.TextColumn('Раздел ФРП', width='medium'),
                                     'Тема ФРП': st.column_config.TextColumn('Тема ФРП', width='medium'),
                                 }
                             )
-                            
-                            if st.button(f"💾 Сохранить изменения", key=f'llm_save_{idx}'):
-                                # Обновляем записи из отредактированной таблицы
-                                updated_records = []
-                                for i, row in edited_df.iterrows():
-                                    if i < len(records):
-                                        updated_rec = records[i].copy()
-                                        updated_rec['section'] = str(row['Раздел']).strip()
-                                        updated_rec['frp_section'] = str(row['Раздел ФРП']).strip()
-                                        updated_rec['topic'] = str(row['Тема']).strip()
-                                        updated_rec['frp_topic'] = str(row['Тема ФРП']).strip()
-                                        updated_records.append(updated_rec)
-                                    else:
-                                        # Новая запись (если пользователь добавил строку)
-                                        new_rec = {
-                                            'subject': subject,
-                                            'class': class_num,
-                                            'section': str(row['Раздел']).strip(),
-                                            'frp_section': str(row['Раздел ФРП']).strip(),
-                                            'topic': str(row['Тема']).strip(),
-                                            'frp_topic': str(row['Тема ФРП']).strip()
-                                        }
-                                        updated_records.append(new_rec)
-                                
-                                st.session_state.llm_results[pair_key] = updated_records
-                                st.success("Изменения сохранены!")
+
+                            all_edited[pair_key] = (edited_df, records, subject, class_num)
+
+                            if st.button("💾 Сохранить изменения", key=f'llm_save_{pair_key}'):
+                                updated = _records_from_editor(edited_df, records, subject, class_num)
+                                st.session_state.llm_results[pair_key] = updated
+                                st.success("✅ Изменения сохранены!")
                                 st.rerun()
-                
-                # Объединение всех результатов и сохранение
-                if len(st.session_state.llm_results) == len(subject_class_pairs):
-                    st.markdown("---")
-                    st.subheader("📥 Сохранение результатов")
-                    
-                    if st.button("💾 Объединить и сохранить JSON", type="primary", key='llm_save_all'):
-                        # Объединяем все записи
-                        all_records = []
-                        for pair_key in sorted(st.session_state.llm_results.keys()):
-                            records = st.session_state.llm_results[pair_key]
-                            all_records.extend(records)
-                        
-                        # Создаем финальный JSON
-                        final_json = {}
-                        for i, rec in enumerate(all_records):
-                            key = f"content_{i+1:04d}"
-                            final_json[key] = {
-                                'subject': rec.get('subject', ''),
-                                'class': rec.get('class', ''),
-                                'section': rec.get('section', ''),
-                                'topic': rec.get('topic', ''),
-                                'text': '',  # Текст будет добавлен на следующем этапе
-                                'sources': ['llm_structure']
-                            }
-                        
-                        st.session_state.llm_final_json = final_json
-                        st.success(f"✅ Объединено {len(all_records)} записей")
-                        st.rerun()
-                    
-                    if st.session_state.get('llm_final_json'):
-                        final_json_str = json.dumps(st.session_state.llm_final_json, ensure_ascii=False, indent=2)
-                        st.download_button(
-                            "📥 Скачать JSON файл",
-                            final_json_str.encode('utf-8'),
-                            file_name="llm_structured_content.json",
-                            mime="application/json",
-                            key='llm_download_json'
-                        )
+
+                        # --- Кнопки внизу ---
+                        if all_edited:
+                            st.markdown("---")
+                            bot_col1, bot_col2 = st.columns(2)
+
+                            with bot_col1:
+                                if st.button(
+                                    "💾 Сохранить все изменения",
+                                    type="primary",
+                                    key='llm_save_all_btn'
+                                ):
+                                    for pk, (edf, recs, subj, cls) in all_edited.items():
+                                        st.session_state.llm_results[pk] = _records_from_editor(
+                                            edf, recs, subj, cls
+                                        )
+                                    st.success("✅ Все изменения сохранены!")
+                                    st.rerun()
+
+                            with bot_col2:
+                                # Формируем JSON из текущего состояния редакторов (render-time)
+                                current_json = {}
+                                counter = 1
+                                for pk, (edf, _, subj, cls) in all_edited.items():
+                                    for _, row in edf.iterrows():
+                                        section_val = str(row.get('Раздел', '')).strip()
+                                        topic_val = str(row.get('Тема', '')).strip()
+                                        current_json[f"content_{counter:04d}"] = {
+                                            'subject': subj,
+                                            'class': cls,
+                                            'section': section_val,
+                                            'frp_section': str(row.get('Раздел ФРП', '')).strip(),
+                                            'topic': topic_val,
+                                            'frp_topic': str(row.get('Тема ФРП', '')).strip(),
+                                            'text': '',
+                                            'sources': ['llm_structure'],
+                                        }
+                                        counter += 1
+
+                                current_json_str = json.dumps(current_json, ensure_ascii=False, indent=2)
+                                st.download_button(
+                                    "📥 Сохранить файл",
+                                    current_json_str.encode('utf-8'),
+                                    file_name="llm_structured_content.json",
+                                    mime="application/json",
+                                    key='llm_download_json'
+                                )
