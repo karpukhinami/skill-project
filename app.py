@@ -3050,6 +3050,8 @@ elif mode == 'llm_structure':
         st.session_state.llm_formatted_text = None
     if 'llm_results' not in st.session_state:
         st.session_state.llm_results = {}  # {pair_key: [records]}
+    if 'llm_raw_responses' not in st.session_state:
+        st.session_state.llm_raw_responses = {}  # {pair_key: str}
     if 'llm_prompt_template' not in st.session_state:
         st.session_state.llm_prompt_template = """Изучи представленные элементы содержания из ФРП (федеральная рабочая программа) и предложи логичное разделение на разделы и темы внутри разделов, опираясь на все доступные элементы содержания. Твои разделы и темы должны полностью покрывать все элементы, однако не обязательно повторять названия тех разделов и тем, которые представлены сейчас. Ты можешь объединять или разделять разделы и темы, как считаешь логичным. В пределах темы элементы содержания обязательно должны быть логично связаны; существенно разные элементы содержания не должны оказаться в одной теме.
 Составь список разделов и тем внутри каждого раздела, оформи этот список в формате JSON со следующими полями:
@@ -3275,6 +3277,7 @@ elif mode == 'llm_structure':
                                 )
 
                                 if response:
+                                    st.session_state.llm_raw_responses[pair_key] = response
                                     records = parse_llm_response(response, subject, class_num)
                                     if records:
                                         st.session_state.llm_results[pair_key] = records
@@ -3284,6 +3287,7 @@ elif mode == 'llm_structure':
                                         )
                                         st.session_state.llm_results[pair_key] = []
                                 else:
+                                    st.session_state.llm_raw_responses[pair_key] = "(нет ответа от API)"
                                     errors_list.append(f"Ошибка API для {subject}, {class_num}")
 
                                 progress_bar.progress((i + 1) / total_pairs)
@@ -3299,6 +3303,7 @@ elif mode == 'llm_structure':
                         st.success(f"✅ Все группы обработаны ({total_pairs})")
                         if st.button("🔄 Сбросить и обработать заново", key='llm_rerun_all'):
                             st.session_state.llm_results = {}
+                            st.session_state.llm_raw_responses = {}
                             st.rerun()
 
                     # --- Отображение результатов ---
@@ -3321,6 +3326,11 @@ elif mode == 'llm_structure':
 
                             if not records:
                                 st.warning("Нет данных (ошибка при обработке этой группы).")
+                                raw = st.session_state.llm_raw_responses.get(pair_key)
+                                if raw:
+                                    with st.expander("🔍 Сырой ответ модели", expanded=True):
+                                        st.text_area("", value=raw, height=250, disabled=True,
+                                                     key=f'llm_raw_err_{pair_key}')
                                 continue
 
                             df_data = []
@@ -3356,6 +3366,12 @@ elif mode == 'llm_structure':
                                 st.session_state.llm_results[pair_key] = updated
                                 st.success("✅ Изменения сохранены!")
                                 st.rerun()
+
+                            raw = st.session_state.llm_raw_responses.get(pair_key)
+                            if raw:
+                                with st.expander("🔍 Сырой ответ модели", expanded=False):
+                                    st.text_area("", value=raw, height=250, disabled=True,
+                                                 key=f'llm_raw_{pair_key}')
 
                         # --- Кнопки внизу ---
                         if all_edited:
