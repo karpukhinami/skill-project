@@ -59,3 +59,4 @@ generate_sql.py
 load_frp_topics.py
 frp_topics_insert.sql
 models.txt
+openrouter_models.txt
