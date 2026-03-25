@@ -1808,13 +1808,43 @@ st.markdown("*ФРП, кодификатор, JSON → Excel*")
 with st.sidebar:
     st.header("⚙️ Настройки LLM")
 
+    st.markdown("""
+<style>
+section[data-testid="stSidebar"] div[role="radiogroup"] {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label {
+    padding: 5px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: normal !important;
+    line-height: 1.4;
+    font-size: 0.83em;
+    transition: background 0.1s ease;
+}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {
+    background: rgba(40, 167, 80, 0.12);
+}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) {
+    background: rgba(40, 167, 80, 0.25);
+    font-weight: 600;
+    color: #1a8a3a;
+}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label > div[data-baseweb="radio"] {
+    display: none;
+}
+</style>
+""", unsafe_allow_html=True)
+
     _model_options = [m['key'] for m in AVAILABLE_MODELS]
     _model_labels  = {m['key']: m['display'] for m in AVAILABLE_MODELS}
     _cur_model = st.session_state.get('selected_model_key', 'claude_direct')
     if _cur_model not in _model_options:
         _cur_model = 'claude_direct'
 
-    st.selectbox(
+    st.radio(
         "Модель",
         options=_model_options,
         index=_model_options.index(_cur_model),
@@ -3876,6 +3906,30 @@ elif mode == 'db_input':
     # Сообщение о фиксации
     if st.session_state.db_fixed:
         st.success(f"Работаем с: {st.session_state.db_fixed_label}")
+        _topic_id = st.session_state.db_fixed_topic_id
+        if _topic_id:
+            _conn_cnt = get_db_conn()
+            if _conn_cnt:
+                try:
+                    with _conn_cnt.cursor() as _cur_cnt:
+                        _cur_cnt.execute(
+                            "SELECT COUNT(*) FROM skill_defs WHERE frp_topic_id = %s",
+                            (_topic_id,)
+                        )
+                        _skills_cnt = _cur_cnt.fetchone()[0]
+                        _cur_cnt.execute(
+                            "SELECT COUNT(*) FROM content_element_defs WHERE frp_topic_id = %s",
+                            (_topic_id,)
+                        )
+                        _content_cnt = _cur_cnt.fetchone()[0]
+                    st.caption(
+                        f"В базе по этой теме: навыков — **{_skills_cnt}**, "
+                        f"элементов содержания — **{_content_cnt}**"
+                    )
+                except Exception:
+                    pass
+                finally:
+                    _conn_cnt.close()
 
     st.markdown("---")
 
