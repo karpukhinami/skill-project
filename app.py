@@ -92,13 +92,14 @@ def split_into_sentences(text: str) -> List[str]:
     return sentences
 
 
-def load_atomize_prompt() -> str:
-    prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts', 'atomize_skill.txt')
+def load_atomize_prompt(mode_type: str = 'skills') -> str:
+    filename = 'atomize_skill.txt' if mode_type == 'skills' else 'atomize_content.txt'
+    prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts', filename)
     try:
         with open(prompt_path, encoding='utf-8') as f:
             return f.read()
     except Exception:
-        return "Разбей текст на атомарные навыки. Верни JSON: {\"atomic_skills\": [...]}"
+        return "Разбей текст на атомарные единицы. Верни JSON: {\"atomic_skills\": [...]}"
 
 st.set_page_config(page_title="Извлечение ФРП", layout="wide")
 
@@ -1336,43 +1337,47 @@ def test_claude_api_key(api_key: str, verify_ssl: bool = True) -> Dict:
     }
 
 def call_claude_api(messages: List[Dict], api_key: str, model: str = None, api_version: str = None, verify_ssl: bool = True) -> Optional[str]:
-    """Вызывает API Claude и возвращает ответ."""
+    """Вызывает API Claude и возвращает ответ. Сохраняет использование токенов в session_state._last_claude_usage."""
     if not api_key:
         return None
-    
-    # Используем сохраненные параметры из проверки ключа, если они есть
+
     if model is None:
         model = st.session_state.get('claude_working_model', "claude-sonnet-4-20250514")
     if api_version is None:
         api_version = st.session_state.get('claude_working_api_version', "2023-06-01")
-    
+
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": api_key,
         "anthropic-version": api_version,
         "content-type": "application/json"
     }
-    
     data = {
         "model": model,
         "max_tokens": 4096,
         "messages": messages
     }
-    
+
+    def _extract(result):
+        usage = result.get('usage', {})
+        st.session_state['_last_claude_usage'] = {
+            'input_tokens':  usage.get('input_tokens', 0),
+            'output_tokens': usage.get('output_tokens', 0),
+            'model': result.get('model', model),
+        }
+        return result.get('content', [{}])[0].get('text', '')
+
     try:
         response = requests.post(url, headers=headers, json=data, timeout=120, verify=verify_ssl)
         response.raise_for_status()
-        result = response.json()
-        return result.get('content', [{}])[0].get('text', '')
+        return _extract(response.json())
     except requests.exceptions.SSLError as ssl_error:
         if verify_ssl:
-            # Пробуем без проверки SSL, если была ошибка SSL
             try:
                 st.warning("⚠️ Ошибка проверки SSL сертификата. Повторяю запрос без проверки SSL...")
                 response = requests.post(url, headers=headers, json=data, timeout=120, verify=False)
                 response.raise_for_status()
-                result = response.json()
-                return result.get('content', [{}])[0].get('text', '')
+                return _extract(response.json())
             except Exception as e2:
                 st.error(f"Ошибка при вызове API Claude (без проверки SSL): {e2}")
                 return None
@@ -1382,6 +1387,36 @@ def call_claude_api(messages: List[Dict], api_key: str, model: str = None, api_v
     except Exception as e:
         st.error(f"Ошибка при вызове API Claude: {e}")
         return None
+
+
+# Цены Claude на 1 000 000 токенов (USD)
+_CLAUDE_PRICES = {
+    'haiku':  {'input': 0.25,  'output': 1.25},
+    'sonnet': {'input': 3.0,   'output': 15.0},
+    'opus':   {'input': 15.0,  'output': 75.0},
+}
+
+def _get_model_prices(model_name: str) -> dict:
+    name = (model_name or '').lower()
+    for key, prices in _CLAUDE_PRICES.items():
+        if key in name:
+            return prices
+    return _CLAUDE_PRICES['sonnet']
+
+
+def _accumulate_cost():
+    """Считывает _last_claude_usage и прибавляет к счётчикам затрат."""
+    usage = st.session_state.get('_last_claude_usage')
+    if not usage:
+        return
+    prices = _get_model_prices(usage.get('model', ''))
+    in_tok  = usage.get('input_tokens', 0)
+    out_tok = usage.get('output_tokens', 0)
+    cost_usd = (in_tok * prices['input'] + out_tok * prices['output']) / 1_000_000
+    st.session_state['db_cost_input_tokens']  = st.session_state.get('db_cost_input_tokens', 0) + in_tok
+    st.session_state['db_cost_output_tokens'] = st.session_state.get('db_cost_output_tokens', 0) + out_tok
+    st.session_state['db_cost_usd']           = st.session_state.get('db_cost_usd', 0.0) + cost_usd
+    st.session_state['_last_claude_usage']    = None
 
 def group_content_by_structure(data_dict: Dict) -> Dict:
     """Группирует записи содержания по предмету -> класс -> раздел -> тема."""
@@ -1705,6 +1740,19 @@ SSL Verify: {verify_ssl}
                     if test_result.get('last_error'):
                         st.json(test_result.get('last_error'))
 
+    # --- Затраты на LLM (текущая сессия работы с БД) ---
+    _in_tok  = st.session_state.get('db_cost_input_tokens', 0)
+    _out_tok = st.session_state.get('db_cost_output_tokens', 0)
+    _usd     = st.session_state.get('db_cost_usd', 0.0)
+    if _in_tok > 0 or _out_tok > 0:
+        st.markdown("---")
+        st.markdown("**💰 Затраты (текущая сессия)**")
+        st.caption(f"Входящие токены: {_in_tok:,}")
+        st.caption(f"Исходящие токены: {_out_tok:,}")
+        st.metric("Стоимость, USD", f"${_usd:.4f}")
+        st.metric("Стоимость, ₽", f"{_usd * 90:.2f} ₽")
+        st.caption("Сбрасывается при сохранении в базу")
+
 # Инициализация session_state
 for k, v in [
     ('mode', 'frp_table'),
@@ -1758,6 +1806,11 @@ for k, v in [
     ('db_show_confirm', False),        # показывать диалог подтверждения
     ('db_save_result', None),          # результат сохранения
     ('db_add_frp_open', False),        # открыта форма добавления новой темы ФРП
+    # --- стоимость вызовов Claude ---
+    ('db_cost_input_tokens', 0),
+    ('db_cost_output_tokens', 0),
+    ('db_cost_usd', 0.0),
+    ('_last_claude_usage', None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -3801,7 +3854,7 @@ elif mode == 'db_input':
     if st.session_state.db_items:
         _api_key = st.session_state.get('claude_api_key', '')
         _verify_ssl = st.session_state.get('claude_verify_ssl', True)
-        _atomize_prompt = load_atomize_prompt()
+        _atomize_prompt = load_atomize_prompt(st.session_state.db_mode_type or 'skills')
 
         _items_to_delete = []
 
@@ -3834,6 +3887,7 @@ elif mode == 'db_input':
                             with st.spinner("Запрос к Claude..."):
                                 _messages = [{"role": "user", "content": f"{_atomize_prompt}\n\nТекст: {_item['text']}"}]
                                 _response = call_claude_api(_messages, _api_key, verify_ssl=_verify_ssl)
+                                _accumulate_cost()
                                 if _response:
                                     try:
                                         _json_match = re.search(r'\{.*\}', _response, re.DOTALL)
@@ -3957,6 +4011,9 @@ elif mode == 'db_input':
                                 st.session_state.db_save_result = _inserted
                                 st.session_state.db_show_confirm = False
                                 st.session_state.db_items = []
+                                st.session_state.db_cost_input_tokens = 0
+                                st.session_state.db_cost_output_tokens = 0
+                                st.session_state.db_cost_usd = 0.0
                                 st.rerun()
                             except Exception as _e:
                                 st.error(f"Ошибка сохранения: {_e}")
