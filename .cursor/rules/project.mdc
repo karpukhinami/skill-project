@@ -1,0 +1,71 @@
+# Подключение к общей базе данных навыков (Neon PostgreSQL)
+
+## Контекст
+
+Это Streamlit-приложение подключается к той же облачной БД (Neon PostgreSQL),
+что использует основное Flask-приложение ФИПИ (отдельный репозиторий).
+Цель: пополнять справочники навыков и элементов содержания из этого приложения.
+
+## Подключение
+
+Строка подключения берётся из переменной окружения DATABASE_URL (формат PostgreSQL DSN).
+Локально — из .env, на Streamlit Cloud — из Secrets.
+Библиотека: psycopg2 (или psycopg2-binary).
+
+import psycopg2, os
+conn = psycopg2.connect(os.environ["DATABASE_URL"])
+
+## Таблицы справочников
+
+### skill_defs — навыки / учебные действия
+Колонки:
+- id SERIAL PRIMARY KEY
+- label_normalized TEXT UNIQUE — нижний регистр, пробелы схлопнуты (ключ дедупликации)
+- label_display TEXT — читаемое название для отображения
+- frp_label TEXT — исходная формулировка из ФРП (до атомизации LLM; совпадает с label_display если без LLM)
+- default_topic_id INTEGER — ссылка на math_curriculum_topics(id), может быть NULL
+- frp_topic_id INTEGER — ссылка на frp_topics(id), может быть NULL
+
+### content_element_defs — элементы содержания
+Структура идентична skill_defs (включая frp_label и frp_topic_id).
+
+### math_curriculum_topics — справочник тем куррикулума (только чтение)
+Колонки: id, subject, section, subsection, topic, topic_description, grade_class
+Используется для привязки навыков/элементов к теме через default_topic_id.
+
+### frp_topics — темы ФРП (основной справочник)
+Колонки: id, grade_class, subject, section, topic, program
+Уникальное ограничение: (grade_class, subject, section, topic).
+Все текстовые поля хранятся в нижнем регистре, без лишних пробелов.
+Заполняется скриптом load_frp_topics.py (или generate_sql.py + Neon SQL Editor).
+
+## Логика записи (upsert)
+
+Перед вставкой нормализовать label:
+  key = re.sub(r'\s+', ' ', label.strip().lower())
+
+Если запись с таким label_normalized уже есть — вернуть существующий id (не дублировать).
+Если нет — INSERT и вернуть новый id.
+
+Пример:
+  cur = conn.cursor()
+  cur.execute("SELECT id FROM skill_defs WHERE label_normalized = %s", (key,))
+  row = cur.fetchone()
+  if row:
+      return row[0]
+  cur.execute(
+      "INSERT INTO skill_defs (label_normalized, label_display, default_topic_id) "
+      "VALUES (%s, %s, %s) RETURNING id",
+      (key, label.strip(), topic_id)
+  )
+  conn.commit()
+  return cur.fetchone()[0]
+
+## Правила работы
+
+- Плейсхолдеры в запросах: %s (psycopg2), не ? и не f-строки.
+- Всегда закрывать соединение после операции (conn.close()).
+- Не изменять схему таблиц из app.py — только читать и INSERT/UPDATE.
+- Строка DATABASE_URL берётся из .env (локально) или переменных окружения.
+- Параметр channel_binding=require убирается из URL перед connect() — psycopg2 его не поддерживает.
+- При изменении схемы в основном проекте — обновить это правило.

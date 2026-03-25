@@ -5,10 +5,100 @@ import pandas as pd
 import json
 import re
 import io
+import os
 import copy
+import urllib.parse as _urlparse
 import streamlit as st
 import requests
 from typing import Dict, List, Tuple, Optional
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─── DB helpers ──────────────────────────────────────────────────────────────
+
+def _clean_db_url(url: str) -> str:
+    """Убирает channel_binding=require, который не поддерживает psycopg2."""
+    parsed = _urlparse.urlparse(url)
+    qs = _urlparse.parse_qs(parsed.query)
+    qs.pop('channel_binding', None)
+    new_q = _urlparse.urlencode({k: v[0] for k, v in qs.items()})
+    return _urlparse.urlunparse(parsed._replace(query=new_q))
+
+
+def get_db_conn():
+    """Возвращает psycopg2-соединение или None."""
+    try:
+        import psycopg2
+        url = os.environ.get('DATABASE_URL', '')
+        if not url:
+            return None
+        return psycopg2.connect(_clean_db_url(url), connect_timeout=10)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_frp_topics_cached() -> pd.DataFrame:
+    """Загружает frp_topics из БД и кэширует на 5 минут."""
+    conn = get_db_conn()
+    if conn is None:
+        return pd.DataFrame(columns=['id', 'grade_class', 'subject', 'section', 'topic', 'program'])
+    try:
+        df = pd.read_sql(
+            "SELECT id, grade_class, subject, section, topic, program FROM frp_topics ORDER BY grade_class, subject, section, topic",
+            conn
+        )
+        conn.close()
+        return df
+    except Exception:
+        conn.close()
+        return pd.DataFrame(columns=['id', 'grade_class', 'subject', 'section', 'topic', 'program'])
+
+
+def normalize_db_text(s: str) -> str:
+    """Нижний регистр, схлопнуть пробелы, убрать точки и пробелы в конце."""
+    s = re.sub(r'\s+', ' ', str(s).strip().lower())
+    s = re.sub(r'[\.\s]+$', '', s)
+    return s
+
+
+def split_into_sentences(text: str) -> List[str]:
+    """
+    Разбивает текст на предложения:
+      - по переводу строки
+      - по '. ЗАГЛАВНАЯ', если перед точкой НЕ одиночная заглавная буква (инициал)
+    """
+    sentences = []
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        parts = []
+        last = 0
+        for m in re.finditer(r'\.\s+(?=[А-ЯA-Z])', line):
+            pos = m.start()
+            before = line[:pos]
+            # Проверяем: предшествует ли точке одиночная заглавная буква (инициал)?
+            if re.search(r'(?:^|[\s.])[А-ЯA-Z]$', before):
+                continue
+            parts.append(line[last:pos])
+            last = m.end() - 1  # начало с заглавной буквы
+        parts.append(line[last:])
+        for p in parts:
+            p = p.strip().rstrip('.')
+            if p:
+                sentences.append(p)
+    return sentences
+
+
+def load_atomize_prompt() -> str:
+    prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts', 'atomize_skill.txt')
+    try:
+        with open(prompt_path, encoding='utf-8') as f:
+            return f.read()
+    except Exception:
+        return "Разбей текст на атомарные навыки. Верни JSON: {\"atomic_skills\": [...]}"
 
 st.set_page_config(page_title="Извлечение ФРП", layout="wide")
 
@@ -1657,6 +1747,17 @@ for k, v in [
     ('llm_formatted_text', None),       # Отформатированный текст для модели
     ('llm_results', {}),                # Результаты обработки по парам предмет+класс
     ('llm_final_json', None),          # Финальный объединенный JSON
+    # --- db_input mode ---
+    ('db_frp_df', None),               # DataFrame frp_topics из БД
+    ('db_fixed', False),               # Зафиксирован ли выбор ФРП
+    ('db_fixed_topic_id', None),       # id выбранной темы frp_topics
+    ('db_fixed_label', ''),            # Текст "Работаем с ..."
+    ('db_mode_type', None),            # 'skills' или 'content'
+    ('db_items', []),                  # список обрабатываемых элементов
+    ('db_uid_counter', 0),             # счётчик уникальных id
+    ('db_show_confirm', False),        # показывать диалог подтверждения
+    ('db_save_result', None),          # результат сохранения
+    ('db_add_frp_open', False),        # открыта форма добавления новой темы ФРП
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1675,6 +1776,7 @@ mode = st.radio(
         'json_merge',     # Объединение JSON
         'json_compare',   # Слияние с сравнением JSON
         'llm_structure',  # Структурирование с помощью LLM
+        'db_input',       # Добавление в базу данных
     ],
     format_func=lambda x: {
         'frp_table': 'Извлечение: ФРП (таблица Excel)',
@@ -1685,6 +1787,7 @@ mode = st.radio(
         'json_merge': 'Объединение нескольких JSON в один',
         'json_compare': 'Слияние и сравнение JSON файлов',
         'llm_structure': '🤖 Структурирование с помощью LLM',
+        'db_input': '💾 Добавление в базу данных',
     }[x],
     horizontal=True,
     key='mode_selector'
@@ -3495,3 +3598,377 @@ elif mode == 'llm_structure':
                                     mime="application/json",
                                     key='llm_download_json'
                                 )
+
+# ============ РЕЖИМ: БАЗА ДАННЫХ ============
+elif mode == 'db_input':
+    st.header("💾 Добавление в базу данных")
+
+    # Проверяем подключение к БД
+    _db_url = os.environ.get('DATABASE_URL', '')
+    if not _db_url:
+        st.error("DATABASE_URL не задан. Создайте файл .env с DATABASE_URL=postgresql://...")
+        st.stop()
+
+    # Загружаем справочник frp_topics
+    if st.session_state.db_frp_df is None:
+        with st.spinner("Загружаю темы ФРП из базы..."):
+            st.session_state.db_frp_df = load_frp_topics_cached()
+    frp_df: pd.DataFrame = st.session_state.db_frp_df
+
+    if frp_df.empty:
+        st.error("Не удалось загрузить таблицу frp_topics. Проверьте подключение к БД.")
+        st.stop()
+
+    # ── Раздел 1: Выбор темы ФРП ─────────────────────────────────────────────
+    st.subheader("Тема ФРП")
+
+    _col1, _col2, _col3, _col4 = st.columns(4)
+
+    # Предмет
+    subjects = sorted(frp_df['subject'].unique())
+    sel_subj = _col1.selectbox("Предмет", [''] + subjects, key='db_sel_subject')
+
+    # Класс — фильтрованный по предмету
+    if sel_subj:
+        classes_df = frp_df[frp_df['subject'] == sel_subj]
+    else:
+        classes_df = frp_df
+    classes = sorted(classes_df['grade_class'].unique(), key=lambda x: int(x) if x.isdigit() else 99)
+    sel_class = _col2.selectbox("Класс", [''] + classes, key='db_sel_class')
+
+    # Раздел — фильтрованный по предмету + классу
+    if sel_subj and sel_class:
+        sections_df = frp_df[(frp_df['subject'] == sel_subj) & (frp_df['grade_class'] == sel_class)]
+    elif sel_subj:
+        sections_df = frp_df[frp_df['subject'] == sel_subj]
+    elif sel_class:
+        sections_df = frp_df[frp_df['grade_class'] == sel_class]
+    else:
+        sections_df = frp_df
+    sections = sorted(sections_df['section'].unique())
+    sel_section = _col3.selectbox("Раздел", [''] + sections, key='db_sel_section')
+
+    # Тема — фильтрованная по всем трём
+    topic_filter = frp_df.copy()
+    if sel_subj:
+        topic_filter = topic_filter[topic_filter['subject'] == sel_subj]
+    if sel_class:
+        topic_filter = topic_filter[topic_filter['grade_class'] == sel_class]
+    if sel_section:
+        topic_filter = topic_filter[topic_filter['section'] == sel_section]
+    topics = sorted(topic_filter['topic'].unique())
+    sel_topic = _col4.selectbox("Тема", [''] + topics, key='db_sel_topic')
+
+    # Получаем id выбранной темы
+    def _get_frp_id(subj, cls, sect, top):
+        row = frp_df[
+            (frp_df['subject'] == subj) &
+            (frp_df['grade_class'] == cls) &
+            (frp_df['section'] == sect) &
+            (frp_df['topic'] == top)
+        ]
+        if not row.empty:
+            return int(row.iloc[0]['id'])
+        return None
+
+    # Кнопки Зафиксировать / Добавить
+    _btn_col1, _btn_col2, _btn_col3 = st.columns([2, 2, 8])
+    with _btn_col1:
+        if st.button("📌 Зафиксировать", key='db_fix_btn', use_container_width=True):
+            if sel_subj and sel_class and sel_section and sel_topic:
+                st.session_state.db_fixed = True
+                st.session_state.db_fixed_topic_id = _get_frp_id(sel_subj, sel_class, sel_section, sel_topic)
+                st.session_state.db_fixed_label = (
+                    f"предмет: **{sel_subj}**, класс: **{sel_class}**, "
+                    f"раздел: **{sel_section}**, тема: **{sel_topic}**"
+                )
+            else:
+                st.warning("Выберите все четыре поля перед фиксацией.")
+
+    with _btn_col2:
+        if st.button("➕ Добавить тему ФРП", key='db_add_frp_btn', use_container_width=True):
+            st.session_state.db_add_frp_open = not st.session_state.db_add_frp_open
+
+    # Форма добавления новой темы ФРП
+    if st.session_state.db_add_frp_open:
+        with st.container(border=True):
+            st.markdown("**Новая тема ФРП**")
+            _f1, _f2, _f3, _f4 = st.columns(4)
+            new_subj    = _f1.text_input("Предмет",  value=sel_subj or '',    key='db_new_subj')
+            new_class   = _f2.text_input("Класс",    value=sel_class or '',   key='db_new_class')
+            new_section = _f3.text_input("Раздел",   value=sel_section or '', key='db_new_section')
+            new_topic   = _f4.text_input("Тема",     value=sel_topic or '',   key='db_new_topic')
+            if st.button("💾 Сохранить новую тему", key='db_save_new_frp'):
+                _ns = normalize_db_text(new_subj)
+                _nc = normalize_db_text(new_class)
+                _nse = normalize_db_text(new_section)
+                _nt = normalize_db_text(new_topic)
+                if _ns and _nc and _nse and _nt:
+                    _existing = frp_df[
+                        (frp_df['subject'] == _ns) & (frp_df['grade_class'] == _nc) &
+                        (frp_df['section'] == _nse) & (frp_df['topic'] == _nt)
+                    ]
+                    if not _existing.empty:
+                        st.warning("Такая комбинация уже есть в базе.")
+                    else:
+                        _conn = get_db_conn()
+                        if _conn:
+                            try:
+                                _cur = _conn.cursor()
+                                _cur.execute(
+                                    "INSERT INTO frp_topics (grade_class, subject, section, topic, program) "
+                                    "VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                                    (_nc, _ns, _nse, _nt, 'базовый')
+                                )
+                                _new_id = _cur.fetchone()[0]
+                                _conn.commit()
+                                _cur.close()
+                                _conn.close()
+                                st.success(f"Тема добавлена (id={_new_id}).")
+                                load_frp_topics_cached.clear()
+                                st.session_state.db_frp_df = None
+                                st.session_state.db_add_frp_open = False
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"Ошибка сохранения: {_e}")
+                        else:
+                            st.error("Нет подключения к БД.")
+                else:
+                    st.warning("Заполните все поля.")
+
+    # Сообщение о фиксации
+    if st.session_state.db_fixed:
+        st.success(f"Работаем с: {st.session_state.db_fixed_label}")
+
+    st.markdown("---")
+
+    # ── Раздел 2: Тип + ввод текста ──────────────────────────────────────────
+    _tab_col1, _tab_col2, _tab_col3 = st.columns([2, 2, 8])
+    with _tab_col1:
+        _skills_active = st.session_state.db_mode_type == 'skills'
+        if st.button(
+            "📚 Навыки" if not _skills_active else "📚 **Навыки** ✓",
+            key='db_tab_skills',
+            type='primary' if _skills_active else 'secondary',
+            use_container_width=True
+        ):
+            st.session_state.db_mode_type = 'skills'
+            st.rerun()
+    with _tab_col2:
+        _content_active = st.session_state.db_mode_type == 'content'
+        if st.button(
+            "📄 Содержание" if not _content_active else "📄 **Содержание** ✓",
+            key='db_tab_content',
+            type='primary' if _content_active else 'secondary',
+            use_container_width=True
+        ):
+            st.session_state.db_mode_type = 'content'
+            st.rerun()
+
+    if st.session_state.db_mode_type is None:
+        st.info("Выберите тип данных: Навыки или Содержание.")
+
+    input_text = st.text_area(
+        "Вставьте текст для обработки",
+        height=180,
+        key='db_input_text',
+        placeholder="Вставьте текст — он будет разбит на отдельные строки..."
+    )
+
+    if st.button("⚙️ Обработать", key='db_process_btn', type='primary'):
+        if not input_text.strip():
+            st.warning("Введите текст.")
+        elif st.session_state.db_mode_type is None:
+            st.warning("Сначала выберите тип: Навыки или Содержание.")
+        else:
+            _sentences = split_into_sentences(input_text)
+            _new_items = []
+            for _s in _sentences:
+                st.session_state.db_uid_counter += 1
+                _new_items.append({
+                    'uid': st.session_state.db_uid_counter,
+                    'text': _s,
+                    'original_frp': _s,
+                    'sub_items': [],
+                    'llm_done': False,
+                })
+            st.session_state.db_items = _new_items
+            st.rerun()
+
+    st.markdown("---")
+
+    # ── Раздел 3: Обработанные элементы ──────────────────────────────────────
+    if st.session_state.db_items:
+        _api_key = st.session_state.get('claude_api_key', '')
+        _verify_ssl = st.session_state.get('claude_verify_ssl', True)
+        _atomize_prompt = load_atomize_prompt()
+
+        _items_to_delete = []
+
+        for _i, _item in enumerate(st.session_state.db_items):
+            _uid = _item['uid']
+
+            with st.container(border=True):
+                _row_col1, _row_col2 = st.columns([10, 1])
+                with _row_col1:
+                    _new_text = st.text_area(
+                        f"Элемент {_i + 1}",
+                        value=_item['text'],
+                        height=80,
+                        key=f'db_item_text_{_uid}',
+                        label_visibility='collapsed'
+                    )
+                    st.session_state.db_items[_i]['text'] = _new_text
+                with _row_col2:
+                    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+                    if st.button("🗑️", key=f'db_del_item_{_uid}', help="Удалить"):
+                        _items_to_delete.append(_uid)
+
+                # Кнопка "Доработать" + подэлементы
+                _llm_col1, _llm_col2 = st.columns([2, 10])
+                with _llm_col1:
+                    if st.button("✨ Доработать", key=f'db_atomize_{_uid}'):
+                        if not _api_key:
+                            st.warning("Введите API ключ Claude в боковой панели.")
+                        else:
+                            with st.spinner("Запрос к Claude..."):
+                                _messages = [{"role": "user", "content": f"{_atomize_prompt}\n\nТекст: {_item['text']}"}]
+                                _response = call_claude_api(_messages, _api_key, verify_ssl=_verify_ssl)
+                                if _response:
+                                    try:
+                                        _json_match = re.search(r'\{.*\}', _response, re.DOTALL)
+                                        if _json_match:
+                                            _parsed = json.loads(_json_match.group())
+                                            _atomic = _parsed.get('atomic_skills', [])
+                                            _sub = []
+                                            for _a in _atomic:
+                                                st.session_state.db_uid_counter += 1
+                                                _sub.append({'uid': st.session_state.db_uid_counter, 'text': _a})
+                                            st.session_state.db_items[_i]['sub_items'] = _sub
+                                            st.session_state.db_items[_i]['llm_done'] = True
+                                            st.session_state.db_items[_i]['original_frp'] = _item['text']
+                                            st.rerun()
+                                    except Exception as _e:
+                                        st.error(f"Ошибка разбора ответа LLM: {_e}")
+                                else:
+                                    st.error("LLM не вернул ответ.")
+
+                # Подэлементы от LLM
+                if _item.get('llm_done') and _item.get('sub_items'):
+                    st.markdown("**Атомарные элементы:**")
+                    _subs_to_delete = []
+                    for _j, _sub in enumerate(_item['sub_items']):
+                        _sub_uid = _sub['uid']
+                        _sc1, _sc2 = st.columns([10, 1])
+                        with _sc1:
+                            _new_sub_text = st.text_input(
+                                f"sub_{_uid}_{_j}",
+                                value=_sub['text'],
+                                key=f'db_sub_{_sub_uid}',
+                                label_visibility='collapsed'
+                            )
+                            st.session_state.db_items[_i]['sub_items'][_j]['text'] = _new_sub_text
+                        with _sc2:
+                            if st.button("✕", key=f'db_del_sub_{_sub_uid}', help="Удалить"):
+                                _subs_to_delete.append(_sub_uid)
+
+                    # Удаляем отмеченные подэлементы
+                    if _subs_to_delete:
+                        st.session_state.db_items[_i]['sub_items'] = [
+                            s for s in st.session_state.db_items[_i]['sub_items']
+                            if s['uid'] not in _subs_to_delete
+                        ]
+                        st.rerun()
+
+                    # Кнопка ручного добавления подэлемента
+                    if st.button("＋ Добавить элемент", key=f'db_add_sub_{_uid}'):
+                        st.session_state.db_uid_counter += 1
+                        st.session_state.db_items[_i]['sub_items'].append({
+                            'uid': st.session_state.db_uid_counter, 'text': ''
+                        })
+                        st.rerun()
+
+        # Удаляем отмеченные элементы
+        if _items_to_delete:
+            st.session_state.db_items = [it for it in st.session_state.db_items if it['uid'] not in _items_to_delete]
+            st.rerun()
+
+        st.markdown("---")
+
+        # ── Кнопка "Сохранить в базу" ─────────────────────────────────────────
+        _type_label = 'навыки' if st.session_state.db_mode_type == 'skills' else 'элементы содержания'
+
+        if st.button(f"💾 Сохранить в базу ({_type_label})", type='primary', key='db_save_btn'):
+            if not st.session_state.db_fixed:
+                st.warning("Зафиксируйте тему ФРП перед сохранением.")
+            elif st.session_state.db_mode_type is None:
+                st.warning("Выберите тип данных.")
+            else:
+                st.session_state.db_show_confirm = True
+                st.rerun()
+
+        # Диалог подтверждения
+        if st.session_state.db_show_confirm:
+            with st.container(border=True):
+                st.markdown(f"**Сохраняем в {_type_label}?**")
+                _ok_col, _cancel_col = st.columns(2)
+                with _ok_col:
+                    if st.button("✅ Ок", key='db_confirm_ok'):
+                        # Собираем записи для сохранения
+                        _records = []
+                        for _item in st.session_state.db_items:
+                            if _item.get('llm_done') and _item.get('sub_items'):
+                                for _sub in _item['sub_items']:
+                                    _t = normalize_db_text(_sub['text'])
+                                    if _t:
+                                        _records.append({
+                                            'label': _t,
+                                            'frp_label': normalize_db_text(_item['original_frp'])
+                                        })
+                            else:
+                                _t = normalize_db_text(_item['text'])
+                                if _t:
+                                    _records.append({
+                                        'label': _t,
+                                        'frp_label': normalize_db_text(_item['text'])
+                                    })
+
+                        # Сохраняем в БД
+                        _table = 'skill_defs' if st.session_state.db_mode_type == 'skills' else 'content_element_defs'
+                        _frp_id = st.session_state.db_fixed_topic_id
+                        _conn = get_db_conn()
+                        if not _conn:
+                            st.error("Нет подключения к БД.")
+                        else:
+                            try:
+                                _cur = _conn.cursor()
+                                _inserted = 0
+                                for _rec in _records:
+                                    _cur.execute(
+                                        f"INSERT INTO {_table} (label_normalized, label_display, frp_label, frp_topic_id) "
+                                        f"VALUES (%s, %s, %s, %s) ON CONFLICT (label_normalized) DO NOTHING",
+                                        (_rec['label'], _rec['label'], _rec['frp_label'], _frp_id)
+                                    )
+                                    if _cur.rowcount == 1:
+                                        _inserted += 1
+                                _conn.commit()
+                                _cur.close()
+                                _conn.close()
+                                st.session_state.db_save_result = _inserted
+                                st.session_state.db_show_confirm = False
+                                st.session_state.db_items = []
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"Ошибка сохранения: {_e}")
+
+                with _cancel_col:
+                    if st.button("❌ Отмена", key='db_confirm_cancel'):
+                        st.session_state.db_show_confirm = False
+                        st.rerun()
+
+        # Результат сохранения
+        if st.session_state.db_save_result is not None:
+            st.success(f"Готово! Добавлено {st.session_state.db_save_result} новых записей.")
+            if st.button("Ок", key='db_result_ok'):
+                st.session_state.db_save_result = None
+                st.rerun()

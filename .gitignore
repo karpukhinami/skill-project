@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+wheels/
+*.whl
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+*:Zone.Identifier
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs
+*.log
+logs/
+
+# Temporary / output files
+*.tmp
+*.bak
+*.orig
+
+# Project data files
+frp_content_maths5-9.json
+math_topics_v2.xlsx
+math_topics_mapped.xlsx
+
+# Helper scripts
+build_mapping.py
+_explore.py
+generate_sql.py
+load_frp_topics.py
+frp_topics_insert.sql
