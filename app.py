@@ -4000,66 +4000,75 @@ elif mode == 'db_input':
             with st.container(border=True):
                 _row_col1, _row_col2 = st.columns([10, 1])
                 with _row_col1:
-                    _new_text = st.text_area(
+                    # Значение хранится в st.session_state[key] — не пишем обратно в db_items
+                    st.text_area(
                         f"Элемент {_i + 1}",
                         value=_item['text'],
                         height=80,
                         key=f'db_item_text_{_uid}',
                         label_visibility='collapsed'
                     )
-                    st.session_state.db_items[_i]['text'] = _new_text
                 with _row_col2:
                     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
                     if st.button("🗑️", key=f'db_del_item_{_uid}', help="Удалить"):
                         _items_to_delete.append(_uid)
 
-                # Кнопка "Доработать" + подэлементы
-                _llm_col1, _llm_col2 = st.columns([2, 10])
-                with _llm_col1:
-                    if st.button("✨ Доработать", key=f'db_atomize_{_uid}'):
-                        with st.spinner("Запрос к модели..."):
-                            _messages = [{"role": "user", "content": f"{_atomize_prompt}\n\nТекст: {_item['text']}"}]
-                            _response = call_claude_api(_messages)
-                            _accumulate_cost()
-                            if _response:
-                                try:
-                                    _json_match = re.search(r'\{.*\}', _response, re.DOTALL)
-                                    if _json_match:
-                                        _parsed = json.loads(_json_match.group())
-                                        _atomic = _parsed.get('atomic_skills', [])
-                                        _sub = []
-                                        for _a in _atomic:
-                                            st.session_state.db_uid_counter += 1
-                                            _sub.append({'uid': st.session_state.db_uid_counter, 'text': _a})
-                                        st.session_state.db_items[_i]['sub_items'] = _sub
-                                        st.session_state.db_items[_i]['llm_done'] = True
-                                        st.session_state.db_items[_i]['original_frp'] = _item['text']
-                                        st.rerun()
-                                except Exception as _e:
-                                    st.error(f"Ошибка разбора ответа LLM: {_e}")
-                            else:
-                                st.error("LLM не вернул ответ.")
+                # Кнопки "Доработать" / "Вручную" — показываем только пока не начали редактировать
+                if not _item.get('llm_done'):
+                    _llm_col1, _llm_col2, _llm_col3 = st.columns([3, 3, 6])
+                    with _llm_col1:
+                        if st.button("✨ Доработать", key=f'db_atomize_{_uid}'):
+                            _cur_text = st.session_state.get(f'db_item_text_{_uid}', _item['text'])
+                            with st.spinner("Запрос к модели..."):
+                                _messages = [{"role": "user", "content": f"{_atomize_prompt}\n\nТекст: {_cur_text}"}]
+                                _response = call_claude_api(_messages)
+                                _accumulate_cost()
+                                if _response:
+                                    try:
+                                        _json_match = re.search(r'\{.*\}', _response, re.DOTALL)
+                                        if _json_match:
+                                            _parsed = json.loads(_json_match.group())
+                                            _atomic = _parsed.get('atomic_skills', [])
+                                            _sub = []
+                                            for _a in _atomic:
+                                                st.session_state.db_uid_counter += 1
+                                                _sub.append({'uid': st.session_state.db_uid_counter, 'text': _a})
+                                            st.session_state.db_items[_i]['sub_items'] = _sub
+                                            st.session_state.db_items[_i]['llm_done'] = True
+                                            st.session_state.db_items[_i]['original_frp'] = _cur_text
+                                            st.rerun()
+                                    except Exception as _e:
+                                        st.error(f"Ошибка разбора ответа LLM: {_e}")
+                                else:
+                                    st.error("LLM не вернул ответ.")
+                    with _llm_col2:
+                        if st.button("✏️ Вручную", key=f'db_manual_{_uid}'):
+                            _cur_text = st.session_state.get(f'db_item_text_{_uid}', _item['text'])
+                            st.session_state.db_items[_i]['llm_done'] = True
+                            st.session_state.db_items[_i]['sub_items'] = []
+                            st.session_state.db_items[_i]['original_frp'] = _cur_text
+                            st.rerun()
 
-                # Подэлементы от LLM
-                if _item.get('llm_done') and _item.get('sub_items'):
-                    st.markdown("**Атомарные элементы:**")
+                # Подэлементы — показываются после "Доработать" или "Вручную"
+                if _item.get('llm_done'):
+                    if _item.get('sub_items'):
+                        st.markdown("**Атомарные элементы:**")
                     _subs_to_delete = []
                     for _j, _sub in enumerate(_item['sub_items']):
                         _sub_uid = _sub['uid']
                         _sc1, _sc2 = st.columns([10, 1])
                         with _sc1:
-                            _new_sub_text = st.text_input(
+                            # Значение хранится в st.session_state[key] — не пишем обратно
+                            st.text_input(
                                 f"sub_{_uid}_{_j}",
                                 value=_sub['text'],
                                 key=f'db_sub_{_sub_uid}',
                                 label_visibility='collapsed'
                             )
-                            st.session_state.db_items[_i]['sub_items'][_j]['text'] = _new_sub_text
                         with _sc2:
                             if st.button("✕", key=f'db_del_sub_{_sub_uid}', help="Удалить"):
                                 _subs_to_delete.append(_sub_uid)
 
-                    # Удаляем отмеченные подэлементы
                     if _subs_to_delete:
                         st.session_state.db_items[_i]['sub_items'] = [
                             s for s in st.session_state.db_items[_i]['sub_items']
@@ -4067,7 +4076,6 @@ elif mode == 'db_input':
                         ]
                         st.rerun()
 
-                    # Кнопка ручного добавления подэлемента
                     if st.button("＋ Добавить элемент", key=f'db_add_sub_{_uid}'):
                         st.session_state.db_uid_counter += 1
                         st.session_state.db_items[_i]['sub_items'].append({
@@ -4104,20 +4112,28 @@ elif mode == 'db_input':
                         # Собираем записи для сохранения
                         _records = []
                         for _item in st.session_state.db_items:
-                            if _item.get('llm_done') and _item.get('sub_items'):
-                                for _sub in _item['sub_items']:
-                                    _t = normalize_db_text(_sub['text'])
+                            _cur_item_text = st.session_state.get(
+                                f'db_item_text_{_item["uid"]}', _item['text']
+                            )
+                            if _item.get('llm_done'):
+                                # После доработки (LLM или вручную) — сохраняем подэлементы
+                                for _sub in _item.get('sub_items', []):
+                                    _cur_sub_text = st.session_state.get(
+                                        f'db_sub_{_sub["uid"]}', _sub['text']
+                                    )
+                                    _t = normalize_db_text(_cur_sub_text)
                                     if _t:
                                         _records.append({
                                             'label': _t,
-                                            'frp_label': normalize_db_text(_item['original_frp'])
+                                            'frp_label': normalize_db_text(_item.get('original_frp', _cur_item_text))
                                         })
                             else:
-                                _t = normalize_db_text(_item['text'])
+                                # Без доработки — сохраняем основной текст напрямую
+                                _t = normalize_db_text(_cur_item_text)
                                 if _t:
                                     _records.append({
                                         'label': _t,
-                                        'frp_label': normalize_db_text(_item['text'])
+                                        'frp_label': normalize_db_text(_cur_item_text)
                                     })
 
                         # Сохраняем в БД
