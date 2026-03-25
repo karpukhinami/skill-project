@@ -1206,9 +1206,105 @@ def json_to_excel_sorted(data_dict, columns_title='Содержание'):
 
 # --- Функции для работы с LLM ---
 
+# Список доступных моделей
+AVAILABLE_MODELS = [
+    {
+        'key':       'claude_direct',
+        'display':   'Клод. Просто клод',
+        'model_id':  None,  # определяется из claude_working_model
+        'provider':  'anthropic',
+        'in_price':  3.0,
+        'out_price': 15.0,
+    },
+    {
+        'key':       'google/gemini-2.5-flash',
+        'display':   'Gemini 2.5 Flash — скоростной, мощный',
+        'model_id':  'google/gemini-2.5-flash',
+        'provider':  'openrouter',
+        'in_price':  0.30,
+        'out_price': 2.50,
+    },
+    {
+        'key':       'google/gemini-2.5-flash-lite',
+        'display':   'Gemini 2.5 Flash Lite — быстро и дёшево',
+        'model_id':  'google/gemini-2.5-flash-lite',
+        'provider':  'openrouter',
+        'in_price':  0.10,
+        'out_price': 0.40,
+    },
+    {
+        'key':       'anthropic/claude-haiku-4.5',
+        'display':   'Claude Haiku 4.5 — новейший малыш Claude',
+        'model_id':  'anthropic/claude-haiku-4.5',
+        'provider':  'openrouter',
+        'in_price':  1.00,
+        'out_price': 5.00,
+    },
+    {
+        'key':       'deepseek/deepseek-chat-v3.1',
+        'display':   'DeepSeek V3.1 — отличный русский за копейки',
+        'model_id':  'deepseek/deepseek-chat-v3.1',
+        'provider':  'openrouter',
+        'in_price':  0.27,
+        'out_price': 1.10,
+    },
+    {
+        'key':       'qwen/qwen3-235b-a22b-2507',
+        'display':   'Qwen3 235B — огромный, почти бесплатно',
+        'model_id':  'qwen/qwen3-235b-a22b-2507',
+        'provider':  'openrouter',
+        'in_price':  0.14,
+        'out_price': 0.39,
+    },
+    {
+        'key':       'openai/gpt-4o-mini',
+        'display':   'GPT-4o Mini — надёжный, средняя цена',
+        'model_id':  'openai/gpt-4o-mini',
+        'provider':  'openrouter',
+        'in_price':  0.15,
+        'out_price': 0.60,
+    },
+    {
+        'key':       'openai/gpt-4.1-nano',
+        'display':   'GPT-4.1 Nano — новее и дешевле Mini',
+        'model_id':  'openai/gpt-4.1-nano',
+        'provider':  'openrouter',
+        'in_price':  0.10,
+        'out_price': 0.40,
+    },
+    {
+        'key':       'mistralai/mistral-small-3.1-24b-instruct',
+        'display':   'Mistral Small 3.1 — европейский, самый дешёвый',
+        'model_id':  'mistralai/mistral-small-3.1-24b-instruct',
+        'provider':  'openrouter',
+        'in_price':  0.05,
+        'out_price': 0.15,
+    },
+    {
+        'key':       'microsoft/phi-4',
+        'display':   'Microsoft Phi-4 — маленький, но умный',
+        'model_id':  'microsoft/phi-4',
+        'provider':  'openrouter',
+        'in_price':  0.07,
+        'out_price': 0.14,
+    },
+    {
+        'key':       'meta-llama/llama-3.3-70b-instruct',
+        'display':   'Llama 3.3 70B — открытая Meta',
+        'model_id':  'meta-llama/llama-3.3-70b-instruct',
+        'provider':  'openrouter',
+        'in_price':  0.10,
+        'out_price': 0.25,
+    },
+]
+
+_MODEL_BY_KEY = {m['key']: m for m in AVAILABLE_MODELS}
+
+
 def get_claude_api_key():
-    """Получает API ключ Claude из session_state."""
-    return st.session_state.get('claude_api_key', '')
+    """Получает API ключ Claude из секретов Streamlit или session_state."""
+    return (st.secrets.get("CLAUDE_API_KEY", "")
+            or st.session_state.get('claude_api_key', ''))
 
 def test_claude_api_key(api_key: str, verify_ssl: bool = True) -> Dict:
     """
@@ -1336,72 +1432,100 @@ def test_claude_api_key(api_key: str, verify_ssl: bool = True) -> Dict:
         'last_error': last_error
     }
 
-def call_claude_api(messages: List[Dict], api_key: str, model: str = None, api_version: str = None, verify_ssl: bool = True) -> Optional[str]:
-    """Вызывает API Claude и возвращает ответ. Сохраняет использование токенов в session_state._last_claude_usage."""
-    if not api_key:
-        return None
+def call_claude_api(messages: List[Dict], api_key: str = None, model: str = None, api_version: str = None, verify_ssl: bool = True) -> Optional[str]:
+    """Вызывает API выбранной модели (Anthropic или OpenRouter).
+    Если api_key передан явно, использует его (режим LLM-структурирования).
+    Иначе берёт ключ из st.secrets в зависимости от выбранной модели."""
+    selected_key = st.session_state.get('selected_model_key', 'claude_direct')
+    model_cfg = _MODEL_BY_KEY.get(selected_key, _MODEL_BY_KEY['claude_direct'])
+    provider = model_cfg['provider']
 
-    if model is None:
-        model = st.session_state.get('claude_working_model', "claude-sonnet-4-20250514")
-    if api_version is None:
-        api_version = st.session_state.get('claude_working_api_version', "2023-06-01")
-
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": api_version,
-        "content-type": "application/json"
-    }
-    data = {
-        "model": model,
-        "max_tokens": 4096,
-        "messages": messages
-    }
-
-    def _extract(result):
-        usage = result.get('usage', {})
-        st.session_state['_last_claude_usage'] = {
-            'input_tokens':  usage.get('input_tokens', 0),
-            'output_tokens': usage.get('output_tokens', 0),
-            'model': result.get('model', model),
-        }
-        return result.get('content', [{}])[0].get('text', '')
-
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=120, verify=verify_ssl)
-        response.raise_for_status()
-        return _extract(response.json())
-    except requests.exceptions.SSLError as ssl_error:
-        if verify_ssl:
-            try:
-                st.warning("⚠️ Ошибка проверки SSL сертификата. Повторяю запрос без проверки SSL...")
-                response = requests.post(url, headers=headers, json=data, timeout=120, verify=False)
-                response.raise_for_status()
-                return _extract(response.json())
-            except Exception as e2:
-                st.error(f"Ошибка при вызове API Claude (без проверки SSL): {e2}")
-                return None
-        else:
-            st.error(f"Ошибка SSL при вызове API Claude: {ssl_error}")
+    # --- Anthropic (прямой Claude) ---
+    if provider == 'anthropic':
+        _key = api_key or st.secrets.get("CLAUDE_API_KEY", "") or st.session_state.get('claude_api_key', '')
+        if not _key:
+            st.error("Не задан ключ CLAUDE_API_KEY в секретах Streamlit.")
             return None
-    except Exception as e:
-        st.error(f"Ошибка при вызове API Claude: {e}")
-        return None
+        _model = model or st.session_state.get('claude_working_model', "claude-sonnet-4-20250514")
+        _api_version = api_version or st.session_state.get('claude_working_api_version', "2023-06-01")
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": _key,
+            "anthropic-version": _api_version,
+            "content-type": "application/json",
+        }
+        data = {"model": _model, "max_tokens": 4096, "messages": messages}
+
+        def _extract_anthropic(result):
+            usage = result.get('usage', {})
+            st.session_state['_last_claude_usage'] = {
+                'input_tokens':  usage.get('input_tokens', 0),
+                'output_tokens': usage.get('output_tokens', 0),
+                'model_key': selected_key,
+            }
+            return result.get('content', [{}])[0].get('text', '')
+
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=120, verify=verify_ssl)
+            response.raise_for_status()
+            return _extract_anthropic(response.json())
+        except requests.exceptions.SSLError:
+            if verify_ssl:
+                try:
+                    st.warning("⚠️ SSL ошибка. Повторяю без проверки...")
+                    response = requests.post(url, headers=headers, json=data, timeout=120, verify=False)
+                    response.raise_for_status()
+                    return _extract_anthropic(response.json())
+                except Exception as e2:
+                    st.error(f"Ошибка Claude API (без SSL): {e2}")
+                    return None
+            else:
+                st.error("Ошибка SSL при вызове Claude API.")
+                return None
+        except Exception as e:
+            st.error(f"Ошибка Claude API: {e}")
+            return None
+
+    # --- OpenRouter ---
+    else:
+        _or_key = st.secrets.get("OPENROUTER_API_KEY", "") or st.session_state.get('openrouter_api_key', '')
+        if not _or_key:
+            st.error("Не задан ключ OPENROUTER_API_KEY в секретах Streamlit.")
+            return None
+        _model_id = model_cfg['model_id']
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {_or_key}",
+            "Content-Type": "application/json",
+        }
+        data = {"model": _model_id, "messages": messages}
+
+        def _extract_openrouter(result):
+            usage = result.get('usage', {})
+            st.session_state['_last_claude_usage'] = {
+                'input_tokens':  usage.get('prompt_tokens', 0),
+                'output_tokens': usage.get('completion_tokens', 0),
+                'model_key': selected_key,
+            }
+            choices = result.get('choices', [])
+            if choices:
+                return choices[0].get('message', {}).get('content', '')
+            return ''
+
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=120)
+            response.raise_for_status()
+            return _extract_openrouter(response.json())
+        except Exception as e:
+            st.error(f"Ошибка OpenRouter API ({_model_id}): {e}")
+            return None
 
 
-# Цены Claude на 1 000 000 токенов (USD)
-_CLAUDE_PRICES = {
-    'haiku':  {'input': 0.25,  'output': 1.25},
-    'sonnet': {'input': 3.0,   'output': 15.0},
-    'opus':   {'input': 15.0,  'output': 75.0},
-}
-
-def _get_model_prices(model_name: str) -> dict:
-    name = (model_name or '').lower()
-    for key, prices in _CLAUDE_PRICES.items():
-        if key in name:
-            return prices
-    return _CLAUDE_PRICES['sonnet']
+def _get_model_prices(model_key: str) -> dict:
+    cfg = _MODEL_BY_KEY.get(model_key)
+    if cfg:
+        return {'input': cfg['in_price'], 'output': cfg['out_price']}
+    return {'input': 3.0, 'output': 15.0}
 
 
 def _accumulate_cost():
@@ -1409,7 +1533,8 @@ def _accumulate_cost():
     usage = st.session_state.get('_last_claude_usage')
     if not usage:
         return
-    prices = _get_model_prices(usage.get('model', ''))
+    model_key = usage.get('model_key', st.session_state.get('selected_model_key', 'claude_direct'))
+    prices = _get_model_prices(model_key)
     in_tok  = usage.get('input_tokens', 0)
     out_tok = usage.get('output_tokens', 0)
     cost_usd = (in_tok * prices['input'] + out_tok * prices['output']) / 1_000_000
@@ -1679,66 +1804,24 @@ def parse_llm_response(response_text: str, subject: str, class_num: str) -> List
 st.title("📚 Извлечение и преобразование данных")
 st.markdown("*ФРП, кодификатор, JSON → Excel*")
 
-# Общее окошко для API ключа Claude в sidebar
+# Общий sidebar с выбором модели
 with st.sidebar:
     st.header("⚙️ Настройки LLM")
-    api_key = st.text_input(
-        "API ключ Claude",
-        value=st.session_state.get('claude_api_key', ''),
-        type="password",
-        help="Введите API ключ для работы с Claude Sonnet 4.5",
-        key='claude_api_key_input'
+
+    _model_options = [m['key'] for m in AVAILABLE_MODELS]
+    _model_labels  = {m['key']: m['display'] for m in AVAILABLE_MODELS}
+    _cur_model = st.session_state.get('selected_model_key', 'claude_direct')
+    if _cur_model not in _model_options:
+        _cur_model = 'claude_direct'
+
+    st.selectbox(
+        "Модель",
+        options=_model_options,
+        index=_model_options.index(_cur_model),
+        format_func=lambda k: _model_labels[k],
+        key='selected_model_key',
+        help="OpenRouter — модели на все случаи жизни. «Клод. Просто клод» — прямой доступ к Anthropic API.",
     )
-    if api_key:
-        st.session_state.claude_api_key = api_key
-        st.success("✅ API ключ сохранен")
-    else:
-        st.warning("⚠️ API ключ не введен")
-    
-    verify_ssl = st.checkbox(
-        "Проверять SSL сертификат",
-        value=st.session_state.get('claude_verify_ssl', True),
-        help="Отключите, если возникают ошибки SSL сертификата",
-        key='claude_verify_ssl_input'
-    )
-    st.session_state.claude_verify_ssl = verify_ssl
-    if not verify_ssl:
-        st.warning("⚠️ Проверка SSL отключена")
-    
-    # Кнопка проверки API ключа
-    if api_key:
-        if st.button("🔍 Проверить API ключ", key='test_api_key', use_container_width=True):
-            with st.spinner("Проверка API ключа..."):
-                test_result = test_claude_api_key(api_key, verify_ssl)
-                
-                if test_result.get('valid'):
-                    st.success("✅ API ключ валиден!")
-                    st.markdown("---")
-                    st.markdown("**Параметры подключения:**")
-                    
-                    # Выводим все параметры для копирования
-                    st.code(f"""
-API Version: {test_result.get('api_version')}
-Model: {test_result.get('model')}
-SSL Verify: {verify_ssl}
-                    """, language='text')
-                    
-                    st.markdown("**Заголовки запроса:**")
-                    st.json(test_result.get('headers', {}))
-                    
-                    st.markdown("**Данные запроса:**")
-                    st.json(test_result.get('data', {}))
-                    
-                    if test_result.get('ssl_warning'):
-                        st.warning("⚠️ SSL проверка отключена при тестировании")
-                    
-                    # Сохраняем рабочую версию и модель
-                    st.session_state.claude_working_api_version = test_result.get('api_version')
-                    st.session_state.claude_working_model = test_result.get('model')
-                else:
-                    st.error(f"❌ {test_result.get('error', 'Неизвестная ошибка')}")
-                    if test_result.get('last_error'):
-                        st.json(test_result.get('last_error'))
 
     # --- Затраты на LLM (текущая сессия работы с БД) ---
     _in_tok  = st.session_state.get('db_cost_input_tokens', 0)
@@ -1785,10 +1868,11 @@ for k, v in [
     ('compare_for_section_only', {}),  # Выбор раздела (совпадений нет)
     ('compare_simple_mode', False),     # Режим «простое сравнение»
     ('compare_merged_result', None),    # Результат объединения
-    ('claude_api_key', ''),             # API ключ Claude
-    ('claude_verify_ssl', True),        # Проверка SSL сертификата для Claude API
-    ('claude_working_api_version', '2023-06-01'),  # Рабочая версия API (из проверки ключа)
-    ('claude_working_model', 'claude-sonnet-4-20250514'),  # Рабочая модель (из проверки ключа)
+    ('claude_api_key', ''),             # API ключ Claude (запасной, если нет в secrets)
+    ('claude_verify_ssl', True),        # оставлено для совместимости
+    ('claude_working_api_version', '2023-06-01'),
+    ('claude_working_model', 'claude-sonnet-4-20250514'),
+    ('selected_model_key', 'claude_direct'),  # выбранная модель для работы
     ('llm_content_data', None),         # Загруженные данные содержания для LLM
     ('llm_grouped_data', None),         # Сгруппированные данные
     ('llm_frp_structure', None),        # Структура ФРП разделов и тем
@@ -3456,7 +3540,7 @@ elif mode == 'llm_structure':
         # --- Проверка API ключа ---
         api_key = get_claude_api_key()
         if not api_key:
-            st.warning("⚠️ Для работы с LLM необходимо ввести API ключ Claude в боковой панели.")
+            st.warning("⚠️ Для работы с LLM необходимо добавить ключ CLAUDE_API_KEY в секреты Streamlit.")
         else:
             if st.session_state.llm_grouped_data:
                 # Список пар предмет+класс
@@ -3852,8 +3936,6 @@ elif mode == 'db_input':
 
     # ── Раздел 3: Обработанные элементы ──────────────────────────────────────
     if st.session_state.db_items:
-        _api_key = st.session_state.get('claude_api_key', '')
-        _verify_ssl = st.session_state.get('claude_verify_ssl', True)
         _atomize_prompt = load_atomize_prompt(st.session_state.db_mode_type or 'skills')
 
         _items_to_delete = []
@@ -3881,31 +3963,28 @@ elif mode == 'db_input':
                 _llm_col1, _llm_col2 = st.columns([2, 10])
                 with _llm_col1:
                     if st.button("✨ Доработать", key=f'db_atomize_{_uid}'):
-                        if not _api_key:
-                            st.warning("Введите API ключ Claude в боковой панели.")
-                        else:
-                            with st.spinner("Запрос к Claude..."):
-                                _messages = [{"role": "user", "content": f"{_atomize_prompt}\n\nТекст: {_item['text']}"}]
-                                _response = call_claude_api(_messages, _api_key, verify_ssl=_verify_ssl)
-                                _accumulate_cost()
-                                if _response:
-                                    try:
-                                        _json_match = re.search(r'\{.*\}', _response, re.DOTALL)
-                                        if _json_match:
-                                            _parsed = json.loads(_json_match.group())
-                                            _atomic = _parsed.get('atomic_skills', [])
-                                            _sub = []
-                                            for _a in _atomic:
-                                                st.session_state.db_uid_counter += 1
-                                                _sub.append({'uid': st.session_state.db_uid_counter, 'text': _a})
-                                            st.session_state.db_items[_i]['sub_items'] = _sub
-                                            st.session_state.db_items[_i]['llm_done'] = True
-                                            st.session_state.db_items[_i]['original_frp'] = _item['text']
-                                            st.rerun()
-                                    except Exception as _e:
-                                        st.error(f"Ошибка разбора ответа LLM: {_e}")
-                                else:
-                                    st.error("LLM не вернул ответ.")
+                        with st.spinner("Запрос к модели..."):
+                            _messages = [{"role": "user", "content": f"{_atomize_prompt}\n\nТекст: {_item['text']}"}]
+                            _response = call_claude_api(_messages)
+                            _accumulate_cost()
+                            if _response:
+                                try:
+                                    _json_match = re.search(r'\{.*\}', _response, re.DOTALL)
+                                    if _json_match:
+                                        _parsed = json.loads(_json_match.group())
+                                        _atomic = _parsed.get('atomic_skills', [])
+                                        _sub = []
+                                        for _a in _atomic:
+                                            st.session_state.db_uid_counter += 1
+                                            _sub.append({'uid': st.session_state.db_uid_counter, 'text': _a})
+                                        st.session_state.db_items[_i]['sub_items'] = _sub
+                                        st.session_state.db_items[_i]['llm_done'] = True
+                                        st.session_state.db_items[_i]['original_frp'] = _item['text']
+                                        st.rerun()
+                                except Exception as _e:
+                                    st.error(f"Ошибка разбора ответа LLM: {_e}")
+                            else:
+                                st.error("LLM не вернул ответ.")
 
                 # Подэлементы от LLM
                 if _item.get('llm_done') and _item.get('sub_items'):
