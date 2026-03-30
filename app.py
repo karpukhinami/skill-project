@@ -56,7 +56,42 @@ def load_frp_topics_cached() -> pd.DataFrame:
         return pd.DataFrame(columns=['id', 'grade_class', 'subject', 'section', 'topic', 'program'])
 
 
-def normalize_db_text(s: str) -> str:
+@st.cache_data(ttl=60, show_spinner=False)
+def load_view_data_cached(table: str) -> pd.DataFrame:
+    """Загружает skill_defs или content_element_defs с JOIN frp_topics."""
+    import psycopg2
+    url = os.environ.get('DATABASE_URL', '')
+    if not url:
+        return pd.DataFrame()
+    try:
+        conn = psycopg2.connect(_clean_db_url(url), connect_timeout=10)
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT s.id,
+                       s.label_normalized,
+                       s.frp_label,
+                       s.frp_topic_id,
+                       COALESCE(f.subject,     '(без предмета)') AS subject,
+                       COALESCE(f.grade_class, '—')              AS grade_class,
+                       COALESCE(f.section,     '(без раздела)')  AS section,
+                       COALESCE(f.topic,       '(без темы)')     AS topic
+                FROM {table} s
+                LEFT JOIN frp_topics f ON s.frp_topic_id = f.id
+            """)
+            rows = cur.fetchall()
+            cols  = [d[0] for d in cur.description]
+        conn.close()
+        df = pd.DataFrame(rows, columns=cols)
+        df['_grade_sort'] = pd.to_numeric(df['grade_class'], errors='coerce').fillna(99)
+        df = df.sort_values(
+            ['subject', '_grade_sort', 'section', 'topic', 'frp_label', 'label_normalized']
+        ).drop(columns=['_grade_sort']).reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+
     """Нижний регистр, схлопнуть пробелы, убрать точки и пробелы в конце."""
     s = re.sub(r'\s+', ' ', str(s).strip().lower())
     s = re.sub(r'[\.\s]+$', '', s)
@@ -1929,6 +1964,10 @@ for k, v in [
     ('db_batch_running', False),
     ('db_batch_pos', 0),
     ('db_batch_stop', False),
+    # --- просмотр базы ---
+    ('vdb_type', None),
+    ('vdb_reassign', False),
+    ('vdb_df', None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1948,6 +1987,7 @@ mode = st.radio(
         'json_compare',   # Слияние с сравнением JSON
         'llm_structure',  # Структурирование с помощью LLM
         'db_input',       # Добавление в базу данных
+        'view_db',        # Просмотр базы данных
     ],
     format_func=lambda x: {
         'frp_table': 'Извлечение: ФРП (таблица Excel)',
@@ -1959,6 +1999,7 @@ mode = st.radio(
         'json_compare': 'Слияние и сравнение JSON файлов',
         'llm_structure': '🤖 Структурирование с помощью LLM',
         'db_input': '💾 Добавление в базу данных',
+        'view_db': '📋 Просмотр базы данных',
     }[x],
     horizontal=True,
     key='mode_selector'
@@ -4254,3 +4295,270 @@ elif mode == 'db_input':
             st.success(f"Готово! Добавлено {st.session_state.db_save_result} новых записей.")
 
     _items_editor()
+
+
+# ============ РЕЖИМ: ПРОСМОТР БАЗЫ ДАННЫХ ============
+elif mode == 'view_db':
+    st.header("📋 Просмотр базы данных")
+
+    _vdb_url = os.environ.get('DATABASE_URL', '')
+    if not _vdb_url:
+        st.error("DATABASE_URL не задан.")
+        st.stop()
+
+    # ── Выбор типа данных ─────────────────────────────────────────────────────
+    _vt1, _vt2, _ = st.columns([2, 2, 8])
+    _v_skills  = st.session_state.vdb_type == 'skills'
+    _v_content = st.session_state.vdb_type == 'content'
+    with _vt1:
+        if st.button("📚 Навыки", type='primary' if _v_skills else 'secondary',
+                     use_container_width=True, key='vdb_tab_skills'):
+            st.session_state.vdb_type = 'skills'
+            st.session_state.vdb_df   = None
+            st.session_state.vdb_reassign = False
+            st.rerun()
+    with _vt2:
+        if st.button("📄 Содержание", type='primary' if _v_content else 'secondary',
+                     use_container_width=True, key='vdb_tab_content'):
+            st.session_state.vdb_type = 'content'
+            st.session_state.vdb_df   = None
+            st.session_state.vdb_reassign = False
+            st.rerun()
+
+    if not st.session_state.vdb_type:
+        st.info("Выберите тип данных: Навыки или Содержание.")
+        st.stop()
+
+    # ── Загрузка данных ───────────────────────────────────────────────────────
+    _v_table = 'skill_defs' if st.session_state.vdb_type == 'skills' else 'content_element_defs'
+    _v_typename = 'навыки' if st.session_state.vdb_type == 'skills' else 'элементы содержания'
+
+    if st.session_state.vdb_df is None:
+        with st.spinner("Загружаю данные..."):
+            st.session_state.vdb_df = load_view_data_cached(_v_table)
+
+    _vdf: pd.DataFrame = st.session_state.vdb_df
+    if _vdf.empty:
+        st.warning("В базе нет данных.")
+        if st.button("🔄 Обновить", key='vdb_reload'):
+            load_view_data_cached.clear()
+            st.session_state.vdb_df = None
+            st.rerun()
+        st.stop()
+
+    # ── Фильтры (каскадные) ───────────────────────────────────────────────────
+    _fc1, _fc2, _fc3, _fc4, _fc5 = st.columns([2, 1, 3, 3, 1])
+
+    _vf_subj = _fc1.selectbox(
+        "Предмет", [''] + sorted(_vdf['subject'].unique()), key='vdb_f_subj'
+    )
+    _fdf = _vdf if not _vf_subj else _vdf[_vdf['subject'] == _vf_subj]
+
+    _vf_class = _fc2.selectbox(
+        "Класс",
+        [''] + sorted(_fdf['grade_class'].unique(), key=lambda x: int(x) if x.isdigit() else 99),
+        key='vdb_f_class'
+    )
+    if _vf_class:
+        _fdf = _fdf[_fdf['grade_class'] == _vf_class]
+
+    _vf_sect = _fc3.selectbox(
+        "Раздел", [''] + sorted(_fdf['section'].unique()), key='vdb_f_sect'
+    )
+    if _vf_sect:
+        _fdf = _fdf[_fdf['section'] == _vf_sect]
+
+    _vf_topic = _fc4.selectbox(
+        "Тема", [''] + sorted(_fdf['topic'].unique()), key='vdb_f_topic'
+    )
+    if _vf_topic:
+        _fdf = _fdf[_fdf['topic'] == _vf_topic]
+
+    with _fc5:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if st.button("🔄", key='vdb_reload2', help="Обновить данные"):
+            load_view_data_cached.clear()
+            st.session_state.vdb_df = None
+            st.rerun()
+
+    st.caption(f"Показано: {len(_fdf)} записей ({_v_typename})")
+
+    # ── Кнопка "Сменить раздел/тему" ─────────────────────────────────────────
+    _v_ra = st.session_state.vdb_reassign
+    _ra_c1, _ra_c2 = st.columns([3, 9])
+    with _ra_c1:
+        if st.button(
+            "✏️ Сменить раздел/тему" if not _v_ra else "✖ Отмена",
+            key='vdb_ra_toggle', type='secondary'
+        ):
+            st.session_state.vdb_reassign = not _v_ra
+            st.rerun()
+    if _v_ra:
+        with _ra_c2:
+            st.info("Отметьте записи галочками, затем выберите новую тему ниже.")
+
+    st.markdown("---")
+
+    # ── Список записей ────────────────────────────────────────────────────────
+    if _fdf.empty:
+        st.warning("По выбранным фильтрам ничего не найдено.")
+    else:
+        _prev_subj  = None
+        _prev_grade = None
+        _prev_sect  = None
+
+        for _, _row_group in _fdf.groupby(
+            ['subject', 'grade_class', 'section', 'topic'],
+            sort=False
+        ):
+            # _row_group is a DataFrame for one (subject, grade, section, topic)
+            _g_subj  = _row_group['subject'].iloc[0]
+            _g_grade = _row_group['grade_class'].iloc[0]
+            _g_sect  = _row_group['section'].iloc[0]
+            _g_topic = _row_group['topic'].iloc[0]
+
+            # Section / subject-grade header
+            if (_g_subj, _g_grade) != (_prev_subj, _prev_grade):
+                st.markdown(f"## {_g_subj} — класс {_g_grade}")
+                _prev_subj  = _g_subj
+                _prev_grade = _g_grade
+                _prev_sect  = None
+
+            if _g_sect != _prev_sect:
+                st.markdown(f"### {_g_sect}")
+                _prev_sect = _g_sect
+
+            st.markdown(f"**Тема: {_g_topic}**")
+
+            # Group by frp_label within topic
+            for _flabel, _ldf in _row_group.groupby('frp_label', sort=False):
+                _items = _ldf.to_dict('records')
+                _is_atomized = not (
+                    len(_items) == 1 and _items[0]['label_normalized'] == _flabel
+                )
+
+                if _is_atomized:
+                    if _v_ra:
+                        st.markdown(f"&nbsp;&nbsp;📌 *{_flabel}*", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"&nbsp;&nbsp;📌 *{_flabel}*", unsafe_allow_html=True)
+                    for _it in _items:
+                        if _v_ra:
+                            st.checkbox(
+                                _it['label_normalized'],
+                                key=f'vdb_chk_{_it["id"]}',
+                            )
+                        else:
+                            st.markdown(
+                                f"&nbsp;&nbsp;&nbsp;&nbsp;— {_it['label_normalized']}",
+                                unsafe_allow_html=True
+                            )
+                else:
+                    if _v_ra:
+                        st.checkbox(
+                            _flabel,
+                            key=f'vdb_chk_{_items[0]["id"]}',
+                        )
+                    else:
+                        st.markdown(
+                            f"&nbsp;&nbsp;— {_flabel}",
+                            unsafe_allow_html=True
+                        )
+
+    # ── Панель переназначения ─────────────────────────────────────────────────
+    if _v_ra and not _fdf.empty:
+        _checked_ids = [
+            int(_rid) for _rid in _fdf['id'].tolist()
+            if st.session_state.get(f'vdb_chk_{_rid}', False)
+        ]
+
+        st.markdown("---")
+        with st.container(border=True):
+            _sel_cnt = len(_checked_ids)
+            st.markdown(f"**Выбрано: {_sel_cnt} записей**")
+
+            # "Выбрать все" / "Снять все"
+            _chk_all_c, _unchk_all_c, _ = st.columns([2, 2, 8])
+            with _chk_all_c:
+                if st.button("☑ Выбрать все", key='vdb_check_all'):
+                    for _rid in _fdf['id'].tolist():
+                        st.session_state[f'vdb_chk_{_rid}'] = True
+                    st.rerun()
+            with _unchk_all_c:
+                if st.button("☐ Снять все", key='vdb_uncheck_all'):
+                    for _rid in _fdf['id'].tolist():
+                        st.session_state[f'vdb_chk_{_rid}'] = False
+                    st.rerun()
+
+            if _sel_cnt > 0:
+                st.markdown("**Новая тема:**")
+                if st.session_state.get('db_frp_df') is None:
+                    st.session_state.db_frp_df = load_frp_topics_cached()
+                _frp_r = st.session_state.db_frp_df
+
+                _nc1, _nc2, _nc3, _nc4 = st.columns(4)
+                _nr_subj = _nc1.selectbox(
+                    "Предмет", [''] + sorted(_frp_r['subject'].unique()), key='vdb_r_subj'
+                )
+                _nrdf = _frp_r if not _nr_subj else _frp_r[_frp_r['subject'] == _nr_subj]
+
+                _nr_class = _nc2.selectbox(
+                    "Класс",
+                    [''] + sorted(_nrdf['grade_class'].unique(),
+                                  key=lambda x: int(x) if x.isdigit() else 99),
+                    key='vdb_r_class'
+                )
+                if _nr_class:
+                    _nrdf = _nrdf[_nrdf['grade_class'] == _nr_class]
+
+                _nr_sect = _nc3.selectbox(
+                    "Раздел", [''] + sorted(_nrdf['section'].unique()), key='vdb_r_sect'
+                )
+                if _nr_sect:
+                    _nrdf = _nrdf[_nrdf['section'] == _nr_sect]
+
+                _nr_topic = _nc4.selectbox(
+                    "Тема", [''] + sorted(_nrdf['topic'].unique()), key='vdb_r_topic'
+                )
+
+                if _nr_subj and _nr_class and _nr_sect and _nr_topic:
+                    _new_row = _frp_r[
+                        (_frp_r['subject']     == _nr_subj) &
+                        (_frp_r['grade_class'] == _nr_class) &
+                        (_frp_r['section']     == _nr_sect) &
+                        (_frp_r['topic']       == _nr_topic)
+                    ]
+                    if not _new_row.empty:
+                        _new_frp_id = int(_new_row.iloc[0]['id'])
+                        st.caption(
+                            f"→ {_nr_subj}, класс {_nr_class}, раздел «{_nr_sect}», тема «{_nr_topic}»"
+                        )
+                        if st.button(
+                            f"✅ Переназначить {_sel_cnt} записей",
+                            type='primary', key='vdb_apply_ra'
+                        ):
+                            _ra_conn = get_db_conn()
+                            if _ra_conn:
+                                try:
+                                    with _ra_conn.cursor() as _ra_cur:
+                                        _ra_cur.execute(
+                                            f"UPDATE {_v_table} "
+                                            f"SET frp_topic_id = %s WHERE id = ANY(%s)",
+                                            (_new_frp_id, _checked_ids)
+                                        )
+                                    _ra_conn.commit()
+                                    _ra_conn.close()
+                                    st.success(
+                                        f"✅ Обновлено {_sel_cnt} записей → "
+                                        f"{_nr_sect} / {_nr_topic}"
+                                    )
+                                    load_view_data_cached.clear()
+                                    st.session_state.vdb_df = None
+                                    st.session_state.vdb_reassign = False
+                                    st.rerun()
+                                except Exception as _ra_e:
+                                    st.error(f"Ошибка обновления: {_ra_e}")
+                            else:
+                                st.error("Нет подключения к БД.")
+            else:
+                st.caption("Отметьте хотя бы одну запись в списке выше.")
