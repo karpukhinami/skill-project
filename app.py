@@ -1466,14 +1466,14 @@ def call_claude_api(messages: List[Dict], api_key: str = None, model: str = None
             return result.get('content', [{}])[0].get('text', '')
 
         try:
-            response = requests.post(url, headers=headers, json=data, timeout=120, verify=verify_ssl)
+            response = requests.post(url, headers=headers, json=data, timeout=30, verify=verify_ssl)
             response.raise_for_status()
             return _extract_anthropic(response.json())
         except requests.exceptions.SSLError:
             if verify_ssl:
                 try:
                     st.warning("⚠️ SSL ошибка. Повторяю без проверки...")
-                    response = requests.post(url, headers=headers, json=data, timeout=120, verify=False)
+                    response = requests.post(url, headers=headers, json=data, timeout=30, verify=False)
                     response.raise_for_status()
                     return _extract_anthropic(response.json())
                 except Exception as e2:
@@ -1513,7 +1513,7 @@ def call_claude_api(messages: List[Dict], api_key: str = None, model: str = None
             return ''
 
         try:
-            response = requests.post(url, headers=headers, json=data, timeout=120)
+            response = requests.post(url, headers=headers, json=data, timeout=30)
             response.raise_for_status()
             return _extract_openrouter(response.json())
         except Exception as e:
@@ -1925,6 +1925,10 @@ for k, v in [
     ('db_cost_output_tokens', 0),
     ('db_cost_usd', 0.0),
     ('_last_claude_usage', None),
+    # --- батч "Доработать всё" ---
+    ('db_batch_running', False),
+    ('db_batch_pos', 0),
+    ('db_batch_stop', False),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -3999,31 +4003,9 @@ elif mode == 'db_input':
             disabled=not _has_unprocessed,
             use_container_width=True,
         ):
-            _ap = load_atomize_prompt(st.session_state.db_mode_type or 'skills')
-            _total = len(st.session_state.db_items)
-            with st.status(f"Обрабатываю 0 / {_total}...", expanded=True) as _st:
-                for _i, _item in enumerate(st.session_state.db_items):
-                    if not _item.get('llm_done'):
-                        _cur = st.session_state.get(f'db_item_text_{_item["uid"]}', _item['text'])
-                        _st.update(label=f"Обрабатываю {_i + 1} / {_total}: {_cur[:55]}…")
-                        _msgs = [{"role": "user", "content": f"{_ap}\n\nТекст: {_cur}"}]
-                        _resp = call_claude_api(_msgs)
-                        _accumulate_cost()
-                        if _resp:
-                            try:
-                                _m = re.search(r'\{.*\}', _resp, re.DOTALL)
-                                if _m:
-                                    _p = json.loads(_m.group())
-                                    _sub = []
-                                    for _a in _p.get('atomic_skills', []):
-                                        st.session_state.db_uid_counter += 1
-                                        _sub.append({'uid': st.session_state.db_uid_counter, 'text': _a})
-                                    st.session_state.db_items[_i]['sub_items'] = _sub
-                                    st.session_state.db_items[_i]['llm_done'] = True
-                                    st.session_state.db_items[_i]['original_frp'] = _cur
-                            except Exception as _e:
-                                st.error(f"Ошибка для элемента {_i + 1}: {_e}")
-                _st.update(label=f"Готово — обработано {_total} элементов", state="complete")
+            st.session_state.db_batch_running = True
+            st.session_state.db_batch_pos = 0
+            st.session_state.db_batch_stop = False
             st.rerun()
 
     st.markdown("---")
@@ -4036,6 +4018,56 @@ elif mode == 'db_input':
 
         _atomize_prompt = load_atomize_prompt(st.session_state.db_mode_type or 'skills')
         _type_label = 'навыки' if st.session_state.db_mode_type == 'skills' else 'элементы содержания'
+
+        # --- Батч "Доработать всё": один элемент за фрагмент-рерун ---
+        if st.session_state.get('db_batch_running'):
+            _bp  = st.session_state.db_batch_pos
+            _bt  = len(st.session_state.db_items)
+            _bap = load_atomize_prompt(st.session_state.db_mode_type or 'skills')
+
+            _pb_col, _stop_col = st.columns([6, 1])
+            with _pb_col:
+                st.progress(
+                    _bp / max(_bt, 1),
+                    text=f"Обрабатываю {min(_bp + 1, _bt)} / {_bt}…  *(нажмите ⛔ чтобы остановить)*"
+                )
+            with _stop_col:
+                if st.button("⛔ Стоп", key='db_batch_stop_btn', use_container_width=True):
+                    st.session_state.db_batch_running = False
+                    st.session_state.db_batch_stop = True
+                    st.rerun()
+
+            if _bp < _bt:
+                _bitem = st.session_state.db_items[_bp]
+                if not _bitem.get('llm_done'):
+                    _bcur = st.session_state.get(f'db_item_text_{_bitem["uid"]}', _bitem['text'])
+                    with st.spinner(f"Элемент {_bp + 1} / {_bt}: {_bcur[:60]}…"):
+                        _bmsgs = [{"role": "user", "content": f"{_bap}\n\nТекст: {_bcur}"}]
+                        _bresp = call_claude_api(_bmsgs)
+                        _accumulate_cost()
+                        if _bresp:
+                            try:
+                                _bm = re.search(r'\{.*\}', _bresp, re.DOTALL)
+                                if _bm:
+                                    _bp_parsed = json.loads(_bm.group())
+                                    _bsub = []
+                                    for _ba in _bp_parsed.get('atomic_skills', []):
+                                        st.session_state.db_uid_counter += 1
+                                        _bsub.append({'uid': st.session_state.db_uid_counter, 'text': _ba})
+                                    st.session_state.db_items[_bp]['sub_items'] = _bsub
+                                    st.session_state.db_items[_bp]['llm_done'] = True
+                                    st.session_state.db_items[_bp]['original_frp'] = _bcur
+                            except Exception as _be:
+                                st.warning(f"Элемент {_bp + 1}: не удалось разобрать ответ ({_be})")
+                st.session_state.db_batch_pos = _bp + 1
+                if _bp + 1 >= _bt:
+                    st.session_state.db_batch_running = False
+                st.rerun()
+            else:
+                st.session_state.db_batch_running = False
+                st.rerun()
+
+            return  # пока идёт батч — не рисуем остальное
 
         _items_to_delete = []
 
