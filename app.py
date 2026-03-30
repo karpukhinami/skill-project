@@ -3966,31 +3966,75 @@ elif mode == 'db_input':
         placeholder="Вставьте текст — он будет разбит на отдельные строки..."
     )
 
-    if st.button("⚙️ Обработать", key='db_process_btn', type='primary'):
-        if not input_text.strip():
-            st.warning("Введите текст.")
-        elif st.session_state.db_mode_type is None:
-            st.warning("Сначала выберите тип: Навыки или Содержание.")
-        else:
-            _sentences = split_into_sentences(input_text)
-            _new_items = []
-            for _s in _sentences:
-                st.session_state.db_uid_counter += 1
-                _new_items.append({
-                    'uid': st.session_state.db_uid_counter,
-                    'text': _s,
-                    'original_frp': _s,
-                    'sub_items': [],
-                    'llm_done': False,
-                })
-            st.session_state.db_items = _new_items
+    _proc_col, _all_col, _spacer = st.columns([2, 3, 7])
+    with _proc_col:
+        if st.button("⚙️ Обработать", key='db_process_btn', type='primary', use_container_width=True):
+            if not input_text.strip():
+                st.warning("Введите текст.")
+            elif st.session_state.db_mode_type is None:
+                st.warning("Сначала выберите тип: Навыки или Содержание.")
+            else:
+                _sentences = split_into_sentences(input_text)
+                _new_items = []
+                for _s in _sentences:
+                    st.session_state.db_uid_counter += 1
+                    _new_items.append({
+                        'uid': st.session_state.db_uid_counter,
+                        'text': _s,
+                        'original_frp': _s,
+                        'sub_items': [],
+                        'llm_done': False,
+                    })
+                st.session_state.db_items = _new_items
+                st.rerun()
+
+    with _all_col:
+        _has_unprocessed = bool(st.session_state.db_items) and any(
+            not it.get('llm_done') for it in st.session_state.db_items
+        )
+        if st.button(
+            "✨ Доработать всё",
+            key='db_atomize_all_btn',
+            disabled=not _has_unprocessed,
+            use_container_width=True,
+        ):
+            _ap = load_atomize_prompt(st.session_state.db_mode_type or 'skills')
+            _total = len(st.session_state.db_items)
+            with st.status(f"Обрабатываю 0 / {_total}...", expanded=True) as _st:
+                for _i, _item in enumerate(st.session_state.db_items):
+                    if not _item.get('llm_done'):
+                        _cur = st.session_state.get(f'db_item_text_{_item["uid"]}', _item['text'])
+                        _st.update(label=f"Обрабатываю {_i + 1} / {_total}: {_cur[:55]}…")
+                        _msgs = [{"role": "user", "content": f"{_ap}\n\nТекст: {_cur}"}]
+                        _resp = call_claude_api(_msgs)
+                        _accumulate_cost()
+                        if _resp:
+                            try:
+                                _m = re.search(r'\{.*\}', _resp, re.DOTALL)
+                                if _m:
+                                    _p = json.loads(_m.group())
+                                    _sub = []
+                                    for _a in _p.get('atomic_skills', []):
+                                        st.session_state.db_uid_counter += 1
+                                        _sub.append({'uid': st.session_state.db_uid_counter, 'text': _a})
+                                    st.session_state.db_items[_i]['sub_items'] = _sub
+                                    st.session_state.db_items[_i]['llm_done'] = True
+                                    st.session_state.db_items[_i]['original_frp'] = _cur
+                            except Exception as _e:
+                                st.error(f"Ошибка для элемента {_i + 1}: {_e}")
+                _st.update(label=f"Готово — обработано {_total} элементов", state="complete")
             st.rerun()
 
     st.markdown("---")
 
-    # ── Раздел 3: Обработанные элементы ──────────────────────────────────────
-    if st.session_state.db_items:
+    # ── Раздел 3: Обработанные элементы (фрагмент — не перерисовывает всю страницу) ──
+    @st.fragment
+    def _items_editor():
+        if not st.session_state.db_items:
+            return
+
         _atomize_prompt = load_atomize_prompt(st.session_state.db_mode_type or 'skills')
+        _type_label = 'навыки' if st.session_state.db_mode_type == 'skills' else 'элементы содержания'
 
         _items_to_delete = []
 
@@ -4091,8 +4135,6 @@ elif mode == 'db_input':
         st.markdown("---")
 
         # ── Кнопка "Сохранить в базу" ─────────────────────────────────────────
-        _type_label = 'навыки' if st.session_state.db_mode_type == 'skills' else 'элементы содержания'
-
         if st.button(f"💾 Сохранить в базу ({_type_label})", type='primary', key='db_save_btn'):
             if not st.session_state.db_fixed:
                 st.warning("Зафиксируйте тему ФРП перед сохранением.")
@@ -4163,7 +4205,7 @@ elif mode == 'db_input':
                                 st.session_state.db_cost_input_tokens = 0
                                 st.session_state.db_cost_output_tokens = 0
                                 st.session_state.db_cost_usd = 0.0
-                                st.rerun()
+                                st.rerun(scope="app")
                             except Exception as _e:
                                 st.error(f"Ошибка сохранения: {_e}")
 
@@ -4177,4 +4219,6 @@ elif mode == 'db_input':
             st.success(f"Готово! Добавлено {st.session_state.db_save_result} новых записей.")
             if st.button("Ок", key='db_result_ok'):
                 st.session_state.db_save_result = None
-                st.rerun()
+                st.rerun(scope="app")
+
+    _items_editor()
