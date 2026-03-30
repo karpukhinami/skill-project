@@ -3986,6 +3986,7 @@ elif mode == 'db_input':
                         'llm_done': False,
                     })
                 st.session_state.db_items = _new_items
+                st.session_state.db_save_result = None
                 st.rerun()
 
     with _all_col:
@@ -4148,6 +4149,7 @@ elif mode == 'db_input':
         if st.session_state.db_show_confirm:
             with st.container(border=True):
                 st.markdown(f"**Сохраняем в {_type_label}?**")
+                st.caption(st.session_state.get('db_fixed_label', ''))
                 _ok_col, _cancel_col = st.columns(2)
                 with _ok_col:
                     if st.button("✅ Ок", key='db_confirm_ok'):
@@ -4202,6 +4204,7 @@ elif mode == 'db_input':
                                 st.session_state.db_save_result = _inserted
                                 st.session_state.db_show_confirm = False
                                 st.session_state.db_items = []
+                                st.session_state['db_input_text'] = ''
                                 st.session_state.db_cost_input_tokens = 0
                                 st.session_state.db_cost_output_tokens = 0
                                 st.session_state.db_cost_usd = 0.0
@@ -4214,11 +4217,8 @@ elif mode == 'db_input':
                         st.session_state.db_show_confirm = False
                         st.rerun()
 
-        # Результат сохранения
+        # Результат сохранения — остаётся до следующего нажатия "Обработать"
         if st.session_state.db_save_result is not None:
             st.success(f"Готово! Добавлено {st.session_state.db_save_result} новых записей.")
-            if st.button("Ок", key='db_result_ok'):
-                st.session_state.db_save_result = None
-                st.rerun(scope="app")
 
     _items_editor()
