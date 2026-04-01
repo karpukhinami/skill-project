@@ -95,6 +95,7 @@ def load_view_data_cached(table: str) -> pd.DataFrame:
 
 
 
+def normalize_db_text(s: str) -> str:
     """Нижний регистр, схлопнуть пробелы, убрать точки и пробелы в конце."""
     s = re.sub(r'\s+', ' ', str(s).strip().lower())
     s = re.sub(r'[\.\s]+$', '', s)
