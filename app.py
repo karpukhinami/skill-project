@@ -83,9 +83,12 @@ def load_view_data_cached(table: str) -> pd.DataFrame:
         conn.close()
         df = pd.DataFrame(rows, columns=cols)
         df['_grade_sort'] = pd.to_numeric(df['grade_class'], errors='coerce').fillna(99)
+        df['_min_id'] = df.groupby(
+            ['subject', 'grade_class', 'section', 'topic', 'frp_label']
+        )['id'].transform('min')
         df = df.sort_values(
-            ['subject', '_grade_sort', 'section', 'topic', 'frp_label', 'label_normalized']
-        ).drop(columns=['_grade_sort']).reset_index(drop=True)
+            ['subject', '_grade_sort', 'section', 'topic', '_min_id', 'id']
+        ).drop(columns=['_grade_sort', '_min_id']).reset_index(drop=True)
         return df
     except Exception:
         return pd.DataFrame()
@@ -1968,6 +1971,7 @@ for k, v in [
     ('vdb_type', None),
     ('vdb_reassign', False),
     ('vdb_df', None),
+    ('vdb_grp_map', {}),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -3883,21 +3887,23 @@ elif mode == 'db_input':
             return int(row.iloc[0]['id'])
         return None
 
-    # Кнопки Зафиксировать / Добавить
-    _btn_col1, _btn_col2, _btn_col3 = st.columns([2, 2, 8])
-    with _btn_col1:
-        if st.button("📌 Зафиксировать", key='db_fix_btn', use_container_width=True):
-            if sel_subj and sel_class and sel_section and sel_topic:
-                st.session_state.db_fixed = True
-                st.session_state.db_fixed_topic_id = _get_frp_id(sel_subj, sel_class, sel_section, sel_topic)
-                st.session_state.db_fixed_label = (
-                    f"предмет: **{sel_subj}**, класс: **{sel_class}**, "
-                    f"раздел: **{sel_section}**, тема: **{sel_topic}**"
-                )
-            else:
-                st.warning("Выберите все четыре поля перед фиксацией.")
+    # Авто-фиксация темы при каждом рендере по текущему выбору в дропдаунах
+    if sel_subj and sel_class and sel_section and sel_topic:
+        _auto_id = _get_frp_id(sel_subj, sel_class, sel_section, sel_topic)
+        st.session_state.db_fixed          = True
+        st.session_state.db_fixed_topic_id = _auto_id
+        st.session_state.db_fixed_label    = (
+            f"предмет: **{sel_subj}**, класс: **{sel_class}**, "
+            f"раздел: **{sel_section}**, тема: **{sel_topic}**"
+        )
+    else:
+        st.session_state.db_fixed          = False
+        st.session_state.db_fixed_topic_id = None
+        st.session_state.db_fixed_label    = ''
 
-    with _btn_col2:
+    # Кнопка "Добавить тему ФРП"
+    _btn_col1, _btn_col2 = st.columns([2, 10])
+    with _btn_col1:
         if st.button("➕ Добавить тему ФРП", key='db_add_frp_btn', use_container_width=True):
             st.session_state.db_add_frp_open = not st.session_state.db_add_frp_open
 
@@ -4013,7 +4019,10 @@ elif mode == 'db_input':
 
     _proc_col, _all_col, _spacer = st.columns([2, 3, 7])
     with _proc_col:
-        if st.button("⚙️ Обработать", key='db_process_btn', type='primary', use_container_width=True):
+        _proc_disabled = (not st.session_state.db_fixed
+                          or st.session_state.db_mode_type is None)
+        if st.button("⚙️ Обработать", key='db_process_btn', type='primary',
+                     use_container_width=True, disabled=_proc_disabled):
             if not input_text.strip():
                 st.warning("Введите текст.")
             elif st.session_state.db_mode_type is None:
@@ -4406,6 +4415,7 @@ elif mode == 'view_db':
         _prev_subj  = None
         _prev_grade = None
         _prev_sect  = None
+        _grp_map    = {}  # grp_key → [item_ids] — для режима переназначения
 
         for _, _row_group in _fdf.groupby(
             ['subject', 'grade_class', 'section', 'topic'],
@@ -4432,62 +4442,66 @@ elif mode == 'view_db':
 
             # Group by frp_label within topic
             for _flabel, _ldf in _row_group.groupby('frp_label', sort=False):
-                _items = _ldf.to_dict('records')
+                _items     = _ldf.to_dict('records')
+                _item_ids  = [it['id'] for it in _items]
+                _grp_key   = f'vdb_chk_g{min(_item_ids)}'
                 _is_atomized = not (
                     len(_items) == 1 and _items[0]['label_normalized'] == _flabel
                 )
+                # Register group → ids mapping for use in reassign panel
+                _grp_map[_grp_key] = _item_ids
 
                 if _is_atomized:
                     if _v_ra:
-                        st.markdown(f"&nbsp;&nbsp;📌 *{_flabel}*", unsafe_allow_html=True)
+                        st.checkbox(f"📌 {_flabel}", key=_grp_key)
                     else:
                         st.markdown(f"&nbsp;&nbsp;📌 *{_flabel}*", unsafe_allow_html=True)
                     for _it in _items:
-                        if _v_ra:
-                            st.checkbox(
-                                _it['label_normalized'],
-                                key=f'vdb_chk_{_it["id"]}',
-                            )
-                        else:
-                            st.markdown(
-                                f"&nbsp;&nbsp;&nbsp;&nbsp;— {_it['label_normalized']}",
-                                unsafe_allow_html=True
-                            )
+                        st.markdown(
+                            f"&nbsp;&nbsp;&nbsp;&nbsp;— {_it['label_normalized']}",
+                            unsafe_allow_html=True
+                        )
                 else:
                     if _v_ra:
-                        st.checkbox(
-                            _flabel,
-                            key=f'vdb_chk_{_items[0]["id"]}',
-                        )
+                        st.checkbox(_flabel, key=_grp_key)
                     else:
                         st.markdown(
                             f"&nbsp;&nbsp;— {_flabel}",
                             unsafe_allow_html=True
                         )
 
+        # Сохраняем актуальную карту групп в session_state
+        st.session_state.vdb_grp_map = _grp_map
+
     # ── Панель переназначения ─────────────────────────────────────────────────
     if _v_ra and not _fdf.empty:
+        _grp_map_saved = st.session_state.get('vdb_grp_map', {})
+
+        # Собираем все id из отмеченных групп
         _checked_ids = [
-            int(_rid) for _rid in _fdf['id'].tolist()
-            if st.session_state.get(f'vdb_chk_{_rid}', False)
+            rid
+            for gk, ids in _grp_map_saved.items()
+            if st.session_state.get(gk, False)
+            for rid in ids
         ]
 
         st.markdown("---")
         with st.container(border=True):
-            _sel_cnt = len(_checked_ids)
-            st.markdown(f"**Выбрано: {_sel_cnt} записей**")
+            _sel_grps = sum(1 for gk in _grp_map_saved if st.session_state.get(gk, False))
+            _sel_cnt  = len(_checked_ids)
+            st.markdown(f"**Выбрано: {_sel_grps} групп ({_sel_cnt} записей)**")
 
             # "Выбрать все" / "Снять все"
             _chk_all_c, _unchk_all_c, _ = st.columns([2, 2, 8])
             with _chk_all_c:
                 if st.button("☑ Выбрать все", key='vdb_check_all'):
-                    for _rid in _fdf['id'].tolist():
-                        st.session_state[f'vdb_chk_{_rid}'] = True
+                    for gk in _grp_map_saved:
+                        st.session_state[gk] = True
                     st.rerun()
             with _unchk_all_c:
                 if st.button("☐ Снять все", key='vdb_uncheck_all'):
-                    for _rid in _fdf['id'].tolist():
-                        st.session_state[f'vdb_chk_{_rid}'] = False
+                    for gk in _grp_map_saved:
+                        st.session_state[gk] = False
                     st.rerun()
 
             if _sel_cnt > 0:
@@ -4534,7 +4548,7 @@ elif mode == 'view_db':
                             f"→ {_nr_subj}, класс {_nr_class}, раздел «{_nr_sect}», тема «{_nr_topic}»"
                         )
                         if st.button(
-                            f"✅ Переназначить {_sel_cnt} записей",
+                            f"✅ Переназначить {_sel_grps} групп ({_sel_cnt} записей)",
                             type='primary', key='vdb_apply_ra'
                         ):
                             _ra_conn = get_db_conn()
@@ -4554,6 +4568,7 @@ elif mode == 'view_db':
                                     )
                                     load_view_data_cached.clear()
                                     st.session_state.vdb_df = None
+                                    st.session_state.vdb_grp_map = {}
                                     st.session_state.vdb_reassign = False
                                     st.rerun()
                                 except Exception as _ra_e:
@@ -4561,4 +4576,4 @@ elif mode == 'view_db':
                             else:
                                 st.error("Нет подключения к БД.")
             else:
-                st.caption("Отметьте хотя бы одну запись в списке выше.")
+                st.caption("Отметьте хотя бы одну группу в списке выше.")
