@@ -11,6 +11,7 @@ import urllib.parse as _urlparse
 import streamlit as st
 import requests
 from typing import Dict, List, Tuple, Optional
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -161,6 +162,20 @@ def load_atomize_prompt(mode_type: str = 'skills') -> str:
             return f.read()
     except Exception:
         return "Разбей текст на атомарные единицы. Верни JSON: {\"atomic_skills\": [...]}"
+
+
+def load_tag_prompt(step: int) -> str:
+    filename = {
+        1: "tag_prompt_1_extract.txt",
+        2: "tag_prompt_2_normalize.txt",
+        3: "tag_prompt_3_assign.txt",
+    }.get(int(step), "tag_prompt_1_extract.txt")
+    prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts", filename)
+    try:
+        with open(prompt_path, encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
 
 st.set_page_config(page_title="Извлечение ФРП", layout="wide")
 
@@ -1267,6 +1282,56 @@ def json_to_excel_sorted(data_dict, columns_title='Содержание'):
 
 # --- Функции для работы с LLM ---
 
+def _load_openrouter_models_from_file() -> List[Dict]:
+    """
+    Читает список моделей из new_models.txt.
+
+    Формат файла:
+      MODELS = [
+        ("vendor/model", input_price_per_token_usd, output_price_per_token_usd),
+      ]
+
+    В app.py цены хранятся в USD за 1M токенов (как и раньше),
+    поэтому конвертируем: price_per_1m = price_per_token * 1_000_000.
+    """
+    import ast
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "new_models.txt")
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except Exception:
+        return []
+
+    m = re.search(r"MODELS\s*=\s*(\[[\s\S]*?\])\s*$", raw.strip())
+    if not m:
+        return []
+
+    try:
+        items = ast.literal_eval(m.group(1))
+    except Exception:
+        return []
+
+    models: List[Dict] = []
+    for model_id, in_per_tok, out_per_tok in items:
+        model_id = str(model_id).strip()
+        if not model_id:
+            continue
+
+        short = model_id.split("/", 1)[1] if "/" in model_id else model_id
+        models.append(
+            {
+                "key": model_id,
+                "display": short,
+                "model_id": model_id,
+                "provider": "openrouter",
+                "in_price": float(in_per_tok) * 1_000_000,
+                "out_price": float(out_per_tok) * 1_000_000,
+            }
+        )
+
+    return models
+
+
 # Список доступных моделей
 AVAILABLE_MODELS = [
     {
@@ -1277,87 +1342,9 @@ AVAILABLE_MODELS = [
         'in_price':  3.0,
         'out_price': 15.0,
     },
-    {
-        'key':       'google/gemini-2.5-flash',
-        'display':   'Gemini 2.5 Flash — скоростной, мощный',
-        'model_id':  'google/gemini-2.5-flash',
-        'provider':  'openrouter',
-        'in_price':  0.30,
-        'out_price': 2.50,
-    },
-    {
-        'key':       'google/gemini-2.5-flash-lite',
-        'display':   'Gemini 2.5 Flash Lite — быстро и дёшево',
-        'model_id':  'google/gemini-2.5-flash-lite',
-        'provider':  'openrouter',
-        'in_price':  0.10,
-        'out_price': 0.40,
-    },
-    {
-        'key':       'anthropic/claude-haiku-4.5',
-        'display':   'Claude Haiku 4.5 — новейший малыш Claude',
-        'model_id':  'anthropic/claude-haiku-4.5',
-        'provider':  'openrouter',
-        'in_price':  1.00,
-        'out_price': 5.00,
-    },
-    {
-        'key':       'deepseek/deepseek-chat-v3.1',
-        'display':   'DeepSeek V3.1 — отличный русский за копейки',
-        'model_id':  'deepseek/deepseek-chat-v3.1',
-        'provider':  'openrouter',
-        'in_price':  0.27,
-        'out_price': 1.10,
-    },
-    {
-        'key':       'qwen/qwen3-235b-a22b-2507',
-        'display':   'Qwen3 235B — огромный, почти бесплатно',
-        'model_id':  'qwen/qwen3-235b-a22b-2507',
-        'provider':  'openrouter',
-        'in_price':  0.14,
-        'out_price': 0.39,
-    },
-    {
-        'key':       'openai/gpt-4o-mini',
-        'display':   'GPT-4o Mini — надёжный, средняя цена',
-        'model_id':  'openai/gpt-4o-mini',
-        'provider':  'openrouter',
-        'in_price':  0.15,
-        'out_price': 0.60,
-    },
-    {
-        'key':       'openai/gpt-4.1-nano',
-        'display':   'GPT-4.1 Nano — новее и дешевле Mini',
-        'model_id':  'openai/gpt-4.1-nano',
-        'provider':  'openrouter',
-        'in_price':  0.10,
-        'out_price': 0.40,
-    },
-    {
-        'key':       'mistralai/mistral-small-3.1-24b-instruct',
-        'display':   'Mistral Small 3.1 — европейский, самый дешёвый',
-        'model_id':  'mistralai/mistral-small-3.1-24b-instruct',
-        'provider':  'openrouter',
-        'in_price':  0.05,
-        'out_price': 0.15,
-    },
-    {
-        'key':       'microsoft/phi-4',
-        'display':   'Microsoft Phi-4 — маленький, но умный',
-        'model_id':  'microsoft/phi-4',
-        'provider':  'openrouter',
-        'in_price':  0.07,
-        'out_price': 0.14,
-    },
-    {
-        'key':       'meta-llama/llama-3.3-70b-instruct',
-        'display':   'Llama 3.3 70B — открытая Meta',
-        'model_id':  'meta-llama/llama-3.3-70b-instruct',
-        'provider':  'openrouter',
-        'in_price':  0.10,
-        'out_price': 0.25,
-    },
 ]
+
+AVAILABLE_MODELS.extend(_load_openrouter_models_from_file())
 
 _MODEL_BY_KEY = {m['key']: m for m in AVAILABLE_MODELS}
 
@@ -1990,6 +1977,16 @@ for k, v in [
     ('db_batch_running', False),
     ('db_batch_pos', 0),
     ('db_batch_stop', False),
+    # --- первичное тегирование ---
+    ('tag_run_id', None),
+    ('tag_subject_id', None),
+    ('tag_program', 'базовый'),
+    ('tag_only_nonempty', True),
+    ('tag_topic_df', None),
+    ('tag_topic_pos', 0),
+    ('tag_stop', False),
+    ('tag_last_result', None),
+    ('tag_last_topic_id', None),
     # --- просмотр базы ---
     ('vdb_type', None),
     ('vdb_reassign', False),
@@ -2014,6 +2011,7 @@ mode = st.radio(
         'json_compare',   # Слияние с сравнением JSON
         'llm_structure',  # Структурирование с помощью LLM
         'db_input',       # Добавление в базу данных
+        'tagging_init',   # Первичное извлечение тегов
         'view_db',        # Просмотр базы данных
     ],
     format_func=lambda x: {
@@ -2026,6 +2024,7 @@ mode = st.radio(
         'json_compare': 'Слияние и сравнение JSON файлов',
         'llm_structure': '🤖 Структурирование с помощью LLM',
         'db_input': '💾 Добавление в базу данных',
+        'tagging_init': '🏷️ Тегирование: первичное извлечение',
         'view_db': '📋 Просмотр базы данных',
     }[x],
     horizontal=True,
@@ -4344,6 +4343,380 @@ elif mode == 'db_input':
             st.success(f"Готово! Добавлено {st.session_state.db_save_result} новых записей.")
 
     _items_editor()
+
+# ============ РЕЖИМ: ПЕРВИЧНОЕ ТЕГИРОВАНИЕ ============
+elif mode == 'tagging_init':
+    st.header("🏷️ Первичное извлечение тегов по темам")
+
+    _db_url = os.environ.get('DATABASE_URL', '')
+    if not _db_url:
+        st.error("DATABASE_URL не задан. Создайте файл .env с DATABASE_URL=postgresql://...")
+        st.stop()
+
+    # Миграция 005 нужна для хранения промежуточных результатов
+    st.caption("Сырые теги сохраняются в стейджинг-таблицы (до нормализации и создания канонических tags).")
+
+    # Проверим, что применена миграция 005_tag_staging.sql
+    _chk = get_db_conn()
+    if _chk is None:
+        st.error("Нет подключения к БД.")
+        st.stop()
+    try:
+        with _chk.cursor() as _cur:
+            _cur.execute(
+                """
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='tag_extraction_runs'
+                """
+            )
+            _ok = bool(_cur.fetchone())
+        _chk.close()
+        if not _ok:
+            st.error("Не найдены стейджинг-таблицы для тегов. Выполните миграцию `db/migrations/005_tag_staging.sql` в Neon SQL Editor.")
+            st.stop()
+    except Exception:
+        try:
+            _chk.close()
+        except Exception:
+            pass
+        st.error("Не удалось проверить наличие стейджинг-таблиц. Проверьте подключение к БД.")
+        st.stop()
+
+    _subjects_df = load_subjects_cached()
+    if _subjects_df.empty:
+        st.error("Таблица subjects пуста или недоступна. Проверьте миграции.")
+        st.stop()
+
+    _subj_names = sorted(_subjects_df['name'].unique())
+    _subj_name_to_id = (
+        _subjects_df[['name', 'id']]
+        .drop_duplicates()
+        .set_index('name')['id']
+        .to_dict()
+    )
+
+    _c1, _c2, _c3, _c4 = st.columns([3, 2, 2, 5])
+    with _c1:
+        _sel_subj = st.selectbox("Предмет", _subj_names, key='tag_sel_subject_name')
+    with _c2:
+        _sel_program = st.selectbox("Программа", ['базовый', 'профильный'], key='tag_sel_program')
+    with _c3:
+        _only_nonempty = st.checkbox("Только темы с записями", value=True, key='tag_sel_only_nonempty')
+    with _c4:
+        st.caption("Обработка идёт по одной теме за раз: можно смотреть результат и останавливать/продолжать.")
+
+    _sel_subject_id = int(_subj_name_to_id.get(_sel_subj))
+
+    def _load_topics_df(subject_id: int, program: str) -> pd.DataFrame:
+        conn = get_db_conn()
+        if conn is None:
+            return pd.DataFrame()
+        try:
+            df = pd.read_sql(
+                """
+                SELECT f.id,
+                       f.grade_class,
+                       f.section,
+                       f.topic,
+                       f.program,
+                       (SELECT COUNT(*) FROM skill_defs sd WHERE sd.frp_topic_id = f.id) AS skills_cnt,
+                       (SELECT COUNT(*) FROM content_element_defs cd WHERE cd.frp_topic_id = f.id) AS content_cnt
+                FROM frp_topics f
+                WHERE f.subject_id = %s
+                  AND f.program = %s
+                ORDER BY
+                  CASE WHEN f.grade_class ~ '^[0-9]+$' THEN f.grade_class::int ELSE 99 END,
+                  f.section,
+                  f.topic,
+                  f.id
+                """,
+                conn,
+                params=(int(subject_id), str(program)),
+            )
+            conn.close()
+            if df.empty:
+                return df
+            df['total_cnt'] = df['skills_cnt'].fillna(0).astype(int) + df['content_cnt'].fillna(0).astype(int)
+            if _only_nonempty:
+                df = df[df['total_cnt'] > 0].reset_index(drop=True)
+            return df
+        except Exception:
+            conn.close()
+            return pd.DataFrame()
+
+    if st.button("🔄 Обновить список тем", key='tag_refresh_topics'):
+        st.session_state.tag_topic_df = None
+
+    if st.session_state.tag_topic_df is None:
+        st.session_state.tag_topic_df = _load_topics_df(_sel_subject_id, _sel_program)
+
+    _topics_df = st.session_state.tag_topic_df
+    if _topics_df is None or _topics_df.empty:
+        st.warning("Нет тем для выбранного предмета/программы (или нет записей в skill_defs/content_element_defs).")
+        st.stop()
+
+    st.dataframe(
+        _topics_df[['id', 'grade_class', 'section', 'topic', 'program', 'skills_cnt', 'content_cnt', 'total_cnt']],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("---")
+
+    _run_col1, _run_col2, _run_col3 = st.columns([3, 3, 6])
+    with _run_col1:
+        if st.button("🆕 Начать новый прогон", key='tag_new_run_btn', use_container_width=True):
+            _conn = get_db_conn()
+            if _conn is None:
+                st.error("Нет подключения к БД.")
+            else:
+                try:
+                    with _conn.cursor() as _cur:
+                        _cur.execute(
+                            "INSERT INTO tag_extraction_runs(subject_id, program, status) VALUES (%s, %s, %s) RETURNING id",
+                            (_sel_subject_id, _sel_program, 'running'),
+                        )
+                        _rid = int(_cur.fetchone()[0])
+                    _conn.commit()
+                    _conn.close()
+                    st.session_state.tag_run_id = _rid
+                    st.session_state.tag_subject_id = _sel_subject_id
+                    st.session_state.tag_program = _sel_program
+                    st.session_state.tag_topic_pos = 0
+                    st.session_state.tag_stop = False
+                    st.session_state.tag_last_result = None
+                    st.session_state.tag_last_topic_id = None
+                    st.success(f"Создан прогон run_id={_rid}")
+                except Exception as _e:
+                    try:
+                        _conn.close()
+                    except Exception:
+                        pass
+                    st.error(f"Не удалось создать прогон: {_e}")
+
+    with _run_col2:
+        _run_id = st.session_state.get('tag_run_id')
+        st.metric("Текущий run_id", str(_run_id) if _run_id else "—")
+
+    with _run_col3:
+        st.caption("Если закрыли страницу — прогон можно продолжить: run_id хранится в сессии браузера. Позже добавим выбор/резюмирование по run_id из БД.")
+
+    if not st.session_state.get('tag_run_id'):
+        st.info("Создайте новый прогон, чтобы сохранять результаты извлечения.")
+        st.stop()
+
+    _run_id = int(st.session_state.tag_run_id)
+
+    _pos = int(st.session_state.get('tag_topic_pos', 0))
+    _total = len(_topics_df)
+    _pos = max(0, min(_pos, max(_total - 1, 0)))
+    st.session_state.tag_topic_pos = _pos
+
+    _cur_topic = _topics_df.iloc[_pos].to_dict()
+    _cur_topic_id = int(_cur_topic['id'])
+
+    _pcol, _bcol1, _bcol2, _bcol3 = st.columns([6, 2, 2, 2])
+    with _pcol:
+        st.progress((_pos) / max(_total, 1), text=f"Тема {_pos + 1} / {_total}: id={_cur_topic_id} — {_cur_topic.get('section','')} / {_cur_topic.get('topic','')}")
+    with _bcol1:
+        if st.button("⬅️ Назад", key='tag_prev_topic', disabled=_pos <= 0, use_container_width=True):
+            st.session_state.tag_topic_pos = _pos - 1
+            st.session_state.tag_last_result = None
+            st.rerun()
+    with _bcol2:
+        if st.button("➡️ Вперёд", key='tag_next_topic', disabled=_pos >= _total - 1, use_container_width=True):
+            st.session_state.tag_topic_pos = _pos + 1
+            st.session_state.tag_last_result = None
+            st.rerun()
+    with _bcol3:
+        if st.button("⛔ Стоп", key='tag_stop_btn', use_container_width=True):
+            st.session_state.tag_stop = True
+            st.warning("Остановлено. Вы можете продолжить позже, нажмите «Извлечь теги» на нужной теме.")
+
+    def _extract_json_object(text: str) -> Optional[Dict]:
+        if not text:
+            return None
+        t = text.strip()
+        # markdown fences
+        if '```' in t:
+            parts = t.split('```')
+            if len(parts) >= 3:
+                inner = parts[1]
+                lines = inner.split('\n')
+                if lines and lines[0].strip().lower() in ('json', ''):
+                    inner = '\n'.join(lines[1:])
+                t = inner.strip()
+        m_obj = re.search(r'\{[\s\S]*\}', t)
+        if not m_obj:
+            return None
+        try:
+            return json.loads(m_obj.group())
+        except Exception:
+            return None
+
+    def _load_topic_records(topic_id: int) -> List[Dict]:
+        conn = get_db_conn()
+        if conn is None:
+            return []
+        try:
+            skills = pd.read_sql(
+                "SELECT id, frp_label FROM skill_defs WHERE frp_topic_id = %s AND frp_label IS NOT NULL AND btrim(frp_label) <> '' ORDER BY id",
+                conn,
+                params=(topic_id,),
+            )
+            content = pd.read_sql(
+                "SELECT id, frp_label FROM content_element_defs WHERE frp_topic_id = %s AND frp_label IS NOT NULL AND btrim(frp_label) <> '' ORDER BY id",
+                conn,
+                params=(topic_id,),
+            )
+            conn.close()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return []
+
+        records: List[Dict] = []
+        for _, r in skills.iterrows():
+            records.append({"source_table": "skill_defs", "id": int(r["id"]), "text": str(r["frp_label"])})
+        for _, r in content.iterrows():
+            records.append({"source_table": "content_element_defs", "id": int(r["id"]), "text": str(r["frp_label"])})
+        return records
+
+    def _save_extraction(run_id: int, subject_id: int, frp_topic_id: int, items: List[Dict]) -> None:
+        conn = get_db_conn()
+        if conn is None:
+            raise RuntimeError("Нет подключения к БД")
+        with conn.cursor() as cur:
+            for it in items:
+                tags = it.get("tags", [])
+                src_table = it.get("source_table")
+                src_id = int(it.get("id"))
+                for tag in tags:
+                    term = normalize_db_text(tag)
+                    if not term:
+                        continue
+                    # 1) термины
+                    cur.execute(
+                        """
+                        INSERT INTO tag_raw_terms(run_id, subject_id, term)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (run_id, subject_id, term_norm) DO NOTHING
+                        """,
+                        (run_id, subject_id, term),
+                    )
+                    # 2) привязки
+                    cur.execute(
+                        """
+                        INSERT INTO tag_raw_assignments(run_id, subject_id, frp_topic_id, source_table, source_id, term)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (run_id, source_table, source_id, term_norm) DO NOTHING
+                        """,
+                        (run_id, subject_id, frp_topic_id, src_table, src_id, term),
+                    )
+        conn.commit()
+        conn.close()
+
+    if st.session_state.get('tag_stop'):
+        st.info("Остановлено. Снимите «Стоп» просто продолжив обработку вручную на нужной теме.")
+
+    _act1, _act2, _act3 = st.columns([3, 3, 6])
+    with _act1:
+        if st.button("✨ Извлечь теги (эта тема)", key='tag_extract_btn', use_container_width=True):
+            records = _load_topic_records(_cur_topic_id)
+            if not records:
+                st.warning("В этой теме нет записей skill_defs/content_element_defs с frp_label.")
+            else:
+                payload = {
+                    "subject": _sel_subj,
+                    "frp_topic": {
+                        "id": _cur_topic_id,
+                        "grade_class": str(_cur_topic.get("grade_class", "")),
+                        "program": str(_cur_topic.get("program", "")),
+                        "section": str(_cur_topic.get("section", "")),
+                        "topic": str(_cur_topic.get("topic", "")),
+                    },
+                    "records": records,
+                }
+                prompt = load_tag_prompt(1)
+                msgs = [{
+                    "role": "user",
+                    "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+                }]
+                with st.spinner("Запрос к модели..."):
+                    resp = call_claude_api(msgs)
+                    _accumulate_cost()
+                parsed = _extract_json_object(resp or "")
+                if not parsed or "items" not in parsed:
+                    st.error("Не удалось разобрать ответ модели. Попробуйте ещё раз или поменяйте модель.")
+                else:
+                    items = parsed.get("items", [])
+                    # лёгкая валидация
+                    ok_items = []
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        if it.get("source_table") not in ("skill_defs", "content_element_defs"):
+                            continue
+                        if "id" not in it:
+                            continue
+                        tags = it.get("tags", [])
+                        if not isinstance(tags, list) or not tags:
+                            continue
+                        ok_items.append({
+                            "source_table": it["source_table"],
+                            "id": int(it["id"]),
+                            "tags": [normalize_db_text(x) for x in tags if normalize_db_text(x)]
+                        })
+                    if not ok_items:
+                        st.error("Ответ модели не содержит корректных items.")
+                    else:
+                        try:
+                            _save_extraction(_run_id, _sel_subject_id, _cur_topic_id, ok_items)
+                            st.session_state.tag_last_result = ok_items
+                            st.session_state.tag_last_topic_id = _cur_topic_id
+                            st.success(f"Сохранено: {len(ok_items)} записей (привязки + термины).")
+                        except Exception as _e:
+                            st.error(f"Ошибка сохранения в БД: {_e}")
+
+    with _act2:
+        if st.button("🧹 Очистить результаты (эта тема)", key='tag_clear_topic_btn', use_container_width=True):
+            _conn = get_db_conn()
+            if _conn is None:
+                st.error("Нет подключения к БД.")
+            else:
+                try:
+                    with _conn.cursor() as _cur:
+                        _cur.execute(
+                            "DELETE FROM tag_raw_assignments WHERE run_id=%s AND frp_topic_id=%s",
+                            (_run_id, _cur_topic_id),
+                        )
+                    _conn.commit()
+                    _conn.close()
+                    st.session_state.tag_last_result = None
+                    st.success("Удалены привязки для этой темы (термины остаются, если использовались в других темах).")
+                except Exception as _e:
+                    try:
+                        _conn.close()
+                    except Exception:
+                        pass
+                    st.error(f"Ошибка очистки: {_e}")
+
+    with _act3:
+        st.caption("Совет: если тема слишком большая и ответ не влезает — позже добавим автоматическое разбиение на чанки.")
+
+    if st.session_state.get('tag_last_result') and st.session_state.get('tag_last_topic_id') == _cur_topic_id:
+        st.markdown("**Последний результат (эта тема):**")
+        flat_rows = []
+        for it in st.session_state.tag_last_result:
+            flat_rows.append({
+                "source_table": it["source_table"],
+                "id": it["id"],
+                "tags": ", ".join(it["tags"]),
+            })
+        st.dataframe(pd.DataFrame(flat_rows), use_container_width=True, hide_index=True)
 
 
 # ============ РЕЖИМ: ПРОСМОТР БАЗЫ ДАННЫХ ============
