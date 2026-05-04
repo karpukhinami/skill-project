@@ -4356,7 +4356,7 @@ elif mode == 'tagging_init':
     # Миграция 005 нужна для хранения промежуточных результатов
     st.caption("Сырые теги сохраняются в стейджинг-таблицы (до нормализации и создания канонических tags).")
 
-    # Проверим, что применена миграция 005_tag_staging.sql
+    # Проверим, что применена миграция 005_tag_staging.sql (новая схема: тема -> термины)
     _chk = get_db_conn()
     if _chk is None:
         st.error("Нет подключения к БД.")
@@ -4367,7 +4367,7 @@ elif mode == 'tagging_init':
                 """
                 SELECT 1
                 FROM information_schema.tables
-                WHERE table_schema='public' AND table_name='tag_extraction_runs'
+                WHERE table_schema='public' AND table_name='tag_topic_terms'
                 """
             )
             _ok = bool(_cur.fetchone())
@@ -4662,37 +4662,23 @@ elif mode == 'tagging_init':
 
         return records_for_llm, norm_to_sources, proto_to_norm, total_raw
 
-    def _save_extraction(run_id: int, subject_id: int, frp_topic_id: int, items: List[Dict]) -> None:
+    def _save_topic_terms(run_id: int, subject_id: int, frp_topic_id: int, terms: List[str]) -> None:
         conn = get_db_conn()
         if conn is None:
             raise RuntimeError("Нет подключения к БД")
         with conn.cursor() as cur:
-            for it in items:
-                tags = it.get("tags", [])
-                src_table = it.get("source_table")
-                src_id = int(it.get("id"))
-                for tag in tags:
-                    term = normalize_db_text(tag)
-                    if not term:
-                        continue
-                    # 1) термины
-                    cur.execute(
-                        """
-                        INSERT INTO tag_raw_terms(run_id, subject_id, term)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (run_id, subject_id, term_norm) DO NOTHING
-                        """,
-                        (run_id, subject_id, term),
-                    )
-                    # 2) привязки
-                    cur.execute(
-                        """
-                        INSERT INTO tag_raw_assignments(run_id, subject_id, frp_topic_id, source_table, source_id, term)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (run_id, source_table, source_id, term_norm) DO NOTHING
-                        """,
-                        (run_id, subject_id, frp_topic_id, src_table, src_id, term),
-                    )
+            for term in terms:
+                t = normalize_db_text(term)
+                if not t:
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO tag_topic_terms(run_id, subject_id, frp_topic_id, term)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (run_id, frp_topic_id, term_norm) DO NOTHING
+                    """,
+                    (run_id, subject_id, frp_topic_id, t),
+                )
         conn.commit()
         conn.close()
 
@@ -4776,11 +4762,19 @@ elif mode == 'tagging_init':
                         st.error("Ответ модели не содержит корректных items.")
                     else:
                         try:
-                            _save_extraction(_run_id, _sel_subject_id, _cur_topic_id, ok_items)
-                            st.session_state.tag_last_result = ok_items
+                            # Требование: сохраняем ТОЛЬКО "тема -> термины" (каждый термин отдельной строкой)
+                            topic_terms_set = set()
+                            for it in ok_items:
+                                for tg in it.get("tags", []):
+                                    nt = normalize_db_text(tg)
+                                    if nt:
+                                        topic_terms_set.add(nt)
+                            topic_terms = sorted(topic_terms_set)
+                            _save_topic_terms(_run_id, _sel_subject_id, _cur_topic_id, topic_terms)
+                            st.session_state.tag_last_result = [{"term": t} for t in topic_terms]
                             st.session_state.tag_last_topic_id = _cur_topic_id
                             st.success(
-                                f"Сохранено: {len(ok_items)} записей (привязки + термины). "
+                                f"Сохранено терминов по теме: {len(topic_terms)}. "
                                 f"Уникальных frp_label отправлено в модель: {len(records)}."
                             )
                             missing = len(expected_proto_keys - matched_proto_keys)
@@ -4802,13 +4796,13 @@ elif mode == 'tagging_init':
                 try:
                     with _conn.cursor() as _cur:
                         _cur.execute(
-                            "DELETE FROM tag_raw_assignments WHERE run_id=%s AND frp_topic_id=%s",
+                            "DELETE FROM tag_topic_terms WHERE run_id=%s AND frp_topic_id=%s",
                             (_run_id, _cur_topic_id),
                         )
                     _conn.commit()
                     _conn.close()
                     st.session_state.tag_last_result = None
-                    st.success("Удалены привязки для этой темы (термины остаются, если использовались в других темах).")
+                    st.success("Удалены термины для этой темы (только для текущего run_id).")
                 except Exception as _e:
                     try:
                         _conn.close()
@@ -4821,14 +4815,7 @@ elif mode == 'tagging_init':
 
     if st.session_state.get('tag_last_result') and st.session_state.get('tag_last_topic_id') == _cur_topic_id:
         st.markdown("**Последний результат (эта тема):**")
-        flat_rows = []
-        for it in st.session_state.tag_last_result:
-            flat_rows.append({
-                "source_table": it["source_table"],
-                "id": it["id"],
-                "tags": ", ".join(it["tags"]),
-            })
-        st.dataframe(pd.DataFrame(flat_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(st.session_state.tag_last_result), use_container_width=True, hide_index=True)
 
 
 # ============ РЕЖИМ: ПРОСМОТР БАЗЫ ДАННЫХ ============
