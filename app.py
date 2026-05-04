@@ -167,7 +167,7 @@ def load_atomize_prompt(mode_type: str = 'skills') -> str:
 def load_tag_prompt(step: int) -> str:
     filename = {
         1: "tag_prompt_1_extract.txt",
-        2: "tag_prompt_2_normalize.txt",
+        2: "tag_prompt_2a_synonyms.txt",
         3: "tag_prompt_3_assign.txt",
     }.get(int(step), "tag_prompt_1_extract.txt")
     prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts", filename)
@@ -176,6 +176,49 @@ def load_tag_prompt(step: int) -> str:
             return f.read()
     except Exception:
         return ""
+
+
+def load_tag_hierarchy_prompt() -> str:
+    prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts", "tag_prompt_2b_hierarchy.txt")
+    try:
+        with open(prompt_path, encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _subject_subtree_ids(root_subject_id: int) -> List[int]:
+    """Возвращает root + детей (один уровень) + внуков (ещё один уровень)."""
+    conn = get_db_conn()
+    if conn is None:
+        return [int(root_subject_id)]
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH RECURSIVE tree AS (
+                  SELECT id, parent_id, 0 AS depth
+                  FROM subjects
+                  WHERE id = %s AND is_archived = FALSE
+                  UNION ALL
+                  SELECT s.id, s.parent_id, t.depth + 1
+                  FROM subjects s
+                  JOIN tree t ON s.parent_id = t.id
+                  WHERE s.is_archived = FALSE AND t.depth < 5
+                )
+                SELECT id FROM tree
+                """,
+                (int(root_subject_id),),
+            )
+            ids = [int(r[0]) for r in cur.fetchall()]
+        conn.close()
+        return ids or [int(root_subject_id)]
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return [int(root_subject_id)]
 
 st.set_page_config(page_title="Извлечение ФРП", layout="wide")
 
@@ -4428,6 +4471,31 @@ elif mode == 'tagging_init':
         st.error("Не удалось проверить наличие стейджинг-таблиц. Проверьте подключение к БД.")
         st.stop()
 
+    # Проверим, что применена миграция 006_tag_normalization.sql (для нормализации и связей с предметами)
+    _chk2 = get_db_conn()
+    if _chk2 is None:
+        st.error("Нет подключения к БД.")
+        st.stop()
+    try:
+        with _chk2.cursor() as _cur2:
+            _cur2.execute(
+                """
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='tag_syn_runs'
+                """
+            )
+            _ok2 = bool(_cur2.fetchone())
+        _chk2.close()
+        if not _ok2:
+            st.warning("Миграция `db/migrations/006_tag_normalization.sql` ещё не применена. Кнопки нормализации/иерархии будут недоступны.")
+    except Exception:
+        try:
+            _chk2.close()
+        except Exception:
+            pass
+        _ok2 = False
+
     _subjects_df = load_subjects_cached()
     if _subjects_df.empty:
         st.error("Таблица subjects пуста или недоступна. Проверьте миграции.")
@@ -4986,6 +5054,600 @@ elif mode == 'tagging_init':
     if st.session_state.get('tag_last_result') and st.session_state.get('tag_last_topic_id') == _cur_topic_id:
         st.markdown("**Последний результат (эта тема):**")
         st.dataframe(pd.DataFrame(st.session_state.tag_last_result), use_container_width=True, hide_index=True)
+
+    # ===================== НОРМАЛИЗАЦИЯ (внизу страницы) =====================
+    st.markdown("---")
+    st.header("🧠 Нормализация словаря (синонимы → канонические теги)")
+
+    if not _ok2:
+        st.info("Примените миграцию `db/migrations/006_tag_normalization.sql` в Neon SQL Editor, чтобы включить нормализацию и иерархизацию.")
+        st.stop()
+
+    st.caption("Нормализация работает по выбранному предмету и всем его детям: берём уникальные термины из stейджинга, чанкуем по 500, затем делаем merge-pass по каноническим.")
+
+    _ncol1, _ncol2, _ncol3 = st.columns([3, 3, 6])
+    with _ncol1:
+        _root_subject_name = st.selectbox("Корневой предмет для нормализации", _subj_names, index=_subj_names.index(_sel_subj), key='tag_norm_root_subject_name')
+    with _ncol2:
+        _chunk_size = st.number_input("Chunk size", min_value=100, max_value=1500, value=500, step=50, key='tag_norm_chunk_size')
+    with _ncol3:
+        st.caption("При выборе «математика» будут обработаны термины из алгебры/геометрии/вероятности и т.д. Сохраняем, в каких предметах встречалось (через tag_subjects).")
+
+    _root_subject_id = int(_subj_name_to_id.get(_root_subject_name))
+    _subtree_ids = _subject_subtree_ids(_root_subject_id)
+
+    def _get_unique_terms_for_subtree(extraction_run_id: int, subject_ids: List[int]) -> List[Tuple[str, List[int]]]:
+        """
+        Возвращает список (term, [subject_id...]) уникальных term_norm в выбранном дереве предметов,
+        только из строк tag_topic_terms, которые ещё не помечены processed_at.
+        """
+        conn = get_db_conn()
+        if conn is None:
+            return []
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT MIN(term) AS term,
+                           ARRAY_AGG(DISTINCT subject_id) AS subjects
+                    FROM tag_topic_terms
+                    WHERE run_id = %s
+                      AND subject_id = ANY(%s)
+                      AND processed_at IS NULL
+                    GROUP BY term_norm
+                    ORDER BY MIN(term)
+                    """,
+                    (int(extraction_run_id), subject_ids),
+                )
+                rows = cur.fetchall()
+            conn.close()
+            out = []
+            for term, subs in rows:
+                out.append((str(term), [int(x) for x in (subs or [])]))
+            return out
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return []
+
+    _unique_terms = _get_unique_terms_for_subtree(_run_id, _subtree_ids)
+    st.metric("Уникальных терминов к обработке", len(_unique_terms))
+
+    st.caption("Если число слишком большое для одного запроса — это нормально: будет чанкование. Прогресс по чанкам сохраняется в БД.")
+
+    # term -> subject_ids (в каких предметах поддерева встречалось)
+    _term_subjects_map = {normalize_db_text(t): subs for t, subs in _unique_terms}
+    _terms_list = [normalize_db_text(t) for t, _ in _unique_terms if normalize_db_text(t)]
+
+    def _chunk_list(items: List[str], size: int) -> List[List[str]]:
+        out = []
+        cur = []
+        for x in items:
+            cur.append(x)
+            if len(cur) >= size:
+                out.append(cur)
+                cur = []
+        if cur:
+            out.append(cur)
+        return out
+
+    def _ensure_syn_run(extraction_run_id: int, root_subject_id: int, chunk_size: int) -> int:
+        conn = get_db_conn()
+        if conn is None:
+            raise RuntimeError("Нет подключения к БД")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tag_syn_runs(extraction_run_id, root_subject_id, chunk_size, status)
+                VALUES (%s, %s, %s, 'running')
+                RETURNING id
+                """,
+                (int(extraction_run_id), int(root_subject_id), int(chunk_size)),
+            )
+            syn_run_id = int(cur.fetchone()[0])
+        conn.commit()
+        conn.close()
+        return syn_run_id
+
+    def _seed_chunks(syn_run_id: int, phase: str, chunks: List[List[str]]) -> None:
+        conn = get_db_conn()
+        if conn is None:
+            raise RuntimeError("Нет подключения к БД")
+        with conn.cursor() as cur:
+            for idx, ch in enumerate(chunks):
+                cur.execute(
+                    """
+                    INSERT INTO tag_syn_chunks(syn_run_id, phase, chunk_idx, input_terms, status)
+                    VALUES (%s, %s, %s, %s::jsonb, 'pending')
+                    ON CONFLICT (syn_run_id, phase, chunk_idx) DO NOTHING
+                    """,
+                    (int(syn_run_id), str(phase), int(idx), json.dumps(ch, ensure_ascii=False)),
+                )
+        conn.commit()
+        conn.close()
+
+    def _next_pending_chunk(syn_run_id: int, phase: str) -> Optional[Dict]:
+        conn = get_db_conn()
+        if conn is None:
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, chunk_idx, input_terms
+                    FROM tag_syn_chunks
+                    WHERE syn_run_id = %s AND phase = %s AND status = 'pending'
+                    ORDER BY chunk_idx
+                    LIMIT 1
+                    """,
+                    (int(syn_run_id), str(phase)),
+                )
+                row = cur.fetchone()
+            conn.close()
+            if not row:
+                return None
+            return {"id": int(row[0]), "chunk_idx": int(row[1]), "input_terms": row[2]}
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return None
+
+    def _mark_chunk_failed(chunk_id: int, error_text: str) -> None:
+        conn = get_db_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE tag_syn_chunks SET status='failed', error_text=%s WHERE id=%s",
+                    (str(error_text)[:2000], int(chunk_id)),
+                )
+            conn.commit()
+            conn.close()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _apply_synonyms(root_subject_id: int, syn_run_id: int, groups: List[Dict]) -> Tuple[int, int]:
+        """
+        Применяет canonical/aliases:
+        - создаёт/находит tags (subject_id = root_subject_id)
+        - создаёт tag_aliases (subject_id = root_subject_id)
+        - проставляет tag_subjects по union предметов, где встречались термины
+        - помечает tag_topic_terms.processed_at/processsed_run_id для всех термов в группе в выбранном поддереве
+
+        Возвращает (created_tags_cnt, created_aliases_cnt)
+        """
+        created_tags = 0
+        created_aliases = 0
+        conn = get_db_conn()
+        if conn is None:
+            raise RuntimeError("Нет подключения к БД")
+
+        with conn.cursor() as cur:
+            for g in groups:
+                canon = normalize_db_text(g.get("tag", ""))
+                aliases = [normalize_db_text(a) for a in (g.get("aliases", []) or [])]
+                aliases = [a for a in aliases if a and a != canon]
+                if not canon:
+                    continue
+
+                # найти/создать канонический тег
+                cur.execute(
+                    "SELECT id, is_archived FROM tags WHERE subject_id=%s AND tag=%s LIMIT 1",
+                    (int(root_subject_id), canon),
+                )
+                row = cur.fetchone()
+                if row:
+                    tag_id = int(row[0])
+                    if bool(row[1]):
+                        cur.execute("UPDATE tags SET is_archived=FALSE WHERE id=%s", (tag_id,))
+                else:
+                    cur.execute(
+                        "INSERT INTO tags(subject_id, tag, is_new, is_archived) VALUES (%s, %s, TRUE, FALSE) RETURNING id",
+                        (int(root_subject_id), canon),
+                    )
+                    tag_id = int(cur.fetchone()[0])
+                    created_tags += 1
+
+                # алиасы
+                for al in aliases:
+                    # если алиас уже существует как канонический тег, позже merge-pass может его слить
+                    cur.execute(
+                        """
+                        INSERT INTO tag_aliases(subject_id, alias, tag_id, is_archived)
+                        VALUES (%s, %s, %s, FALSE)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (int(root_subject_id), al, int(tag_id)),
+                    )
+                    created_aliases += 1
+
+                # какие предметы покрывает группа: union по canon + aliases (по данным стейджинга)
+                subj_union = set()
+                for term in [canon] + aliases:
+                    for sid in (_term_subjects_map.get(term) or []):
+                        subj_union.add(int(sid))
+                # если вдруг пусто — считаем, что минимум root_subject_id
+                if not subj_union:
+                    subj_union.add(int(root_subject_id))
+
+                for sid in sorted(subj_union):
+                    cur.execute(
+                        """
+                        INSERT INTO tag_subjects(tag_id, subject_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (int(tag_id), int(sid)),
+                    )
+
+                # помечаем обработанными все вхождения этих термов в стейджинге (по поддереву)
+                for term in [canon] + aliases:
+                    cur.execute(
+                        """
+                        UPDATE tag_topic_terms
+                        SET processed_at = COALESCE(processed_at, now()),
+                            processed_run_id = %s
+                        WHERE run_id = %s
+                          AND subject_id = ANY(%s)
+                          AND term_norm = normalize_term(%s)
+                        """,
+                        (int(syn_run_id), int(_run_id), _subtree_ids, term),
+                    )
+
+        conn.commit()
+        conn.close()
+        return created_tags, created_aliases
+
+    def _merge_canonicals(root_subject_id: int, groups: List[Dict]) -> int:
+        """
+        Merge-pass: если алиас из группы уже существует как канонический tag (subject_id=root),
+        то архивируем его и переносим его subject-связи на победителя.
+        Возвращает число архивированных тегов.
+        """
+        archived = 0
+        conn = get_db_conn()
+        if conn is None:
+            raise RuntimeError("Нет подключения к БД")
+        with conn.cursor() as cur:
+            for g in groups:
+                winner = normalize_db_text(g.get("tag", ""))
+                aliases = [normalize_db_text(a) for a in (g.get("aliases", []) or [])]
+                aliases = [a for a in aliases if a and a != winner]
+                if not winner:
+                    continue
+                cur.execute("SELECT id FROM tags WHERE subject_id=%s AND tag=%s AND is_archived=FALSE LIMIT 1", (int(root_subject_id), winner))
+                wrow = cur.fetchone()
+                if not wrow:
+                    continue
+                winner_id = int(wrow[0])
+
+                for al in aliases:
+                    cur.execute("SELECT id FROM tags WHERE subject_id=%s AND tag=%s AND is_archived=FALSE LIMIT 1", (int(root_subject_id), al))
+                    arow = cur.fetchone()
+                    if not arow:
+                        continue
+                    alias_id = int(arow[0])
+                    if alias_id == winner_id:
+                        continue
+
+                    # переносим subject-связи
+                    cur.execute(
+                        """
+                        INSERT INTO tag_subjects(tag_id, subject_id)
+                        SELECT %s, subject_id
+                        FROM tag_subjects
+                        WHERE tag_id = %s
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (int(winner_id), int(alias_id)),
+                    )
+
+                    # добавляем алиас на победителя (на всякий случай)
+                    cur.execute(
+                        """
+                        INSERT INTO tag_aliases(subject_id, alias, tag_id, is_archived)
+                        VALUES (%s, %s, %s, FALSE)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (int(root_subject_id), al, int(winner_id)),
+                    )
+
+                    # репэрентим детей, если кто-то уже ссылался на alias_id
+                    cur.execute(
+                        "UPDATE tags SET parent_id=%s WHERE subject_id=%s AND parent_id=%s",
+                        (int(winner_id), int(root_subject_id), int(alias_id)),
+                    )
+
+                    # архивируем проигравшего
+                    cur.execute("UPDATE tags SET is_archived=TRUE WHERE id=%s", (int(alias_id),))
+                    archived += 1
+
+        conn.commit()
+        conn.close()
+        return archived
+
+    st.markdown("**Действия:**")
+    _a1, _a2, _a3, _a4 = st.columns([3, 3, 3, 3])
+
+    with _a1:
+        _start_norm = st.button("🚀 Запустить синонимизацию", key='tag_syn_start_btn', use_container_width=True, disabled=(len(_unique_terms) == 0))
+    with _a2:
+        _resume_norm = st.button("▶️ Продолжить", key='tag_syn_resume_btn', use_container_width=True)
+    with _a3:
+        _pause_norm = st.button("⏸️ Пауза", key='tag_syn_pause_btn', use_container_width=True)
+    with _a4:
+        _show_last = st.button("📋 Показать статус", key='tag_syn_status_btn', use_container_width=True)
+
+    # --- запуск/продолжение/пауза ---
+    if 'tag_syn_run_id' not in st.session_state:
+        st.session_state.tag_syn_run_id = None
+    if 'tag_syn_phase' not in st.session_state:
+        st.session_state.tag_syn_phase = 'chunk'
+    if 'tag_syn_running' not in st.session_state:
+        st.session_state.tag_syn_running = False
+
+    if _pause_norm:
+        st.session_state.tag_syn_running = False
+
+    if _start_norm:
+        # создаём syn_run и чанки
+        syn_run_id = _ensure_syn_run(_run_id, _root_subject_id, int(_chunk_size))
+        st.session_state.tag_syn_run_id = syn_run_id
+        st.session_state.tag_syn_phase = 'chunk'
+        st.session_state.tag_syn_running = True
+
+        chunks = _chunk_list(_terms_list, int(_chunk_size))
+        _seed_chunks(syn_run_id, 'chunk', chunks)
+        st.success(f"Синонимизация запущена: syn_run_id={syn_run_id}, чанков={len(chunks)}")
+        st.rerun()
+
+    if _resume_norm and st.session_state.get('tag_syn_run_id'):
+        st.session_state.tag_syn_running = True
+        st.rerun()
+
+    if _show_last and st.session_state.get('tag_syn_run_id'):
+        _syn_id = int(st.session_state.tag_syn_run_id)
+        conn = get_db_conn()
+        if conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT phase, status, COUNT(*)
+                    FROM tag_syn_chunks
+                    WHERE syn_run_id=%s
+                    GROUP BY phase, status
+                    ORDER BY phase, status
+                    """,
+                    (_syn_id,),
+                )
+                stats = cur.fetchall()
+            conn.close()
+            st.json([{"phase": a, "status": b, "count": int(c)} for a, b, c in stats])
+
+    # --- обработка одного чанка за rerun (устойчивость к сбоям) ---
+    if st.session_state.get('tag_syn_running') and st.session_state.get('tag_syn_run_id'):
+        _syn_id = int(st.session_state.tag_syn_run_id)
+        _phase = str(st.session_state.get('tag_syn_phase', 'chunk'))
+        pending = _next_pending_chunk(_syn_id, _phase)
+
+        if not pending and _phase == 'chunk':
+            # готовим merge-pass: берём все активные канонические теги по root_subject_id
+            conn = get_db_conn()
+            if conn is None:
+                st.session_state.tag_syn_running = False
+                st.error("Нет подключения к БД для merge-pass.")
+            else:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT tag FROM tags WHERE subject_id=%s AND is_archived=FALSE ORDER BY tag",
+                            (int(_root_subject_id),),
+                        )
+                        canon_tags = [str(r[0]) for r in cur.fetchall()]
+                    conn.close()
+                    merge_chunks = _chunk_list(canon_tags, int(_chunk_size))
+                    _seed_chunks(_syn_id, 'merge', merge_chunks)
+                    st.session_state.tag_syn_phase = 'merge'
+                    st.rerun()
+                except Exception as e:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    st.session_state.tag_syn_running = False
+                    st.error(f"Не удалось подготовить merge-pass: {e}")
+
+        elif not pending and _phase == 'merge':
+            st.session_state.tag_syn_running = False
+            # финал
+            conn = get_db_conn()
+            if conn:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE tag_syn_runs SET status='done' WHERE id=%s", (_syn_id,))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            st.success("Синонимизация завершена (чанки + merge-pass).")
+
+        else:
+            # выполняем один чанк
+            chunk_id = int(pending["id"])
+            chunk_idx = int(pending["chunk_idx"])
+            input_terms = pending["input_terms"]
+            terms = input_terms if isinstance(input_terms, list) else (input_terms or [])
+
+            st.progress(0.5, text=f"Синонимизация: phase={_phase}, chunk {chunk_idx}…")
+            payload = {"subject": _root_subject_name, "terms": terms}
+            prompt = load_tag_prompt(2)
+            msgs = [{"role": "user", "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"}]
+            try:
+                resp = call_claude_api(msgs)
+                _accumulate_cost_for_tag_run(_run_id)
+                parsed = _extract_json_payload(resp or "")
+                if not parsed or "canonical" not in parsed:
+                    raise RuntimeError("Не удалось разобрать ответ (нет поля canonical)")
+                groups = parsed.get("canonical") or []
+                if not isinstance(groups, list) or not groups:
+                    raise RuntimeError("Пустой canonical")
+
+                if _phase == 'chunk':
+                    created_tags, created_aliases = _apply_synonyms(_root_subject_id, _syn_id, groups)
+                else:
+                    archived = _merge_canonicals(_root_subject_id, groups)
+                    created_tags, created_aliases = 0, 0
+
+                # записываем результат чанка
+                conn = get_db_conn()
+                if conn is None:
+                    raise RuntimeError("Нет подключения к БД для записи результата чанка")
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE tag_syn_chunks
+                        SET status='done', result_json=%s::jsonb, applied_at=now()
+                        WHERE id=%s
+                        """,
+                        (json.dumps(parsed, ensure_ascii=False), int(chunk_id)),
+                    )
+                conn.commit()
+                conn.close()
+
+                if _phase == 'chunk':
+                    st.success(f"Chunk {chunk_idx} применён: +{created_tags} tags, +{created_aliases} aliases.")
+                else:
+                    st.success(f"Merge chunk {chunk_idx} применён.")
+
+                st.rerun()
+            except Exception as e:
+                _mark_chunk_failed(chunk_id, str(e))
+                st.session_state.tag_syn_running = False
+                st.error(f"Синонимизация остановлена на chunk {chunk_idx} (phase={_phase}): {e}")
+                st.stop()
+
+    # ===================== ИЕРАРХИЗАЦИЯ (внизу) =====================
+    st.markdown("---")
+    st.header("🧩 Иерархия тегов (child → parent)")
+    st.caption("Запускается отдельно после синонимизации. Используются только активные канонические tags корневого предмета.")
+
+    def _load_active_tags(root_subject_id: int) -> List[str]:
+        conn = get_db_conn()
+        if conn is None:
+            return []
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT tag FROM tags WHERE subject_id=%s AND is_archived=FALSE ORDER BY tag", (int(root_subject_id),))
+                rows = cur.fetchall()
+            conn.close()
+            return [str(r[0]) for r in rows]
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return []
+
+    _tags_for_h = _load_active_tags(_root_subject_id)
+    st.metric("Канонических тегов", len(_tags_for_h))
+
+    _h1, _h2 = st.columns([3, 9])
+    with _h1:
+        _run_h = st.button("🧩 Построить иерархию", key='tag_hierarchy_run_btn', use_container_width=True, disabled=(len(_tags_for_h) == 0))
+    with _h2:
+        st.caption("После построения можно показать дерево как список с отступами.")
+
+    def _apply_hierarchy(root_subject_id: int, edges: List[Dict]) -> None:
+        conn = get_db_conn()
+        if conn is None:
+            raise RuntimeError("Нет подключения к БД")
+        with conn.cursor() as cur:
+            # мапа tag -> id
+            cur.execute("SELECT id, tag FROM tags WHERE subject_id=%s AND is_archived=FALSE", (int(root_subject_id),))
+            mp = {str(t): int(i) for i, t in cur.fetchall()}
+            for e in edges:
+                child = normalize_db_text(e.get("child", ""))
+                parent = normalize_db_text(e.get("parent", ""))
+                if not child or not parent:
+                    continue
+                cid = mp.get(child)
+                pid = mp.get(parent)
+                if not cid or not pid or cid == pid:
+                    continue
+                cur.execute("UPDATE tags SET parent_id=%s WHERE id=%s", (int(pid), int(cid)))
+        conn.commit()
+        conn.close()
+
+    def _build_indented_list(root_subject_id: int) -> List[str]:
+        conn = get_db_conn()
+        if conn is None:
+            return []
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, tag, parent_id FROM tags WHERE subject_id=%s AND is_archived=FALSE", (int(root_subject_id),))
+                rows = cur.fetchall()
+            conn.close()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return []
+
+        nodes = {int(i): {"tag": str(t), "parent_id": (int(p) if p is not None else None)} for i, t, p in rows}
+        children = {}
+        for i, n in nodes.items():
+            children.setdefault(n["parent_id"], []).append(i)
+        for k in children:
+            children[k].sort(key=lambda nid: nodes[nid]["tag"])
+
+        lines = []
+
+        def dfs(nid: int, depth: int):
+            lines.append(("  " * depth) + nodes[nid]["tag"])
+            if depth >= 2:
+                return
+            for ch in children.get(nid, []):
+                dfs(ch, depth + 1)
+
+        roots = children.get(None, [])
+        for r in roots:
+            dfs(r, 0)
+        return lines
+
+    if _run_h:
+        payload = {"subject": _root_subject_name, "tags": _tags_for_h}
+        prompt = load_tag_hierarchy_prompt()
+        msgs = [{"role": "user", "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"}]
+        with st.spinner("Запрос к модели (иерархия)..."):
+            resp = call_claude_api(msgs)
+            _accumulate_cost_for_tag_run(_run_id)
+        parsed = _extract_json_payload(resp or "")
+        if not parsed or "hierarchy" not in parsed:
+            st.error("Не удалось разобрать ответ иерархии.")
+        else:
+            edges = parsed.get("hierarchy") or []
+            try:
+                _apply_hierarchy(_root_subject_id, edges)
+                st.success(f"Иерархия применена: {len(edges)} связей.")
+                st.session_state['tag_hierarchy_last'] = _build_indented_list(_root_subject_id)
+            except Exception as e:
+                st.error(f"Не удалось применить иерархию: {e}")
+
+    if st.session_state.get('tag_hierarchy_last'):
+        st.markdown("**Структура (до 3 уровней):**")
+        st.code("\n".join(st.session_state['tag_hierarchy_last']), language="text")
 
 
 # ============ РЕЖИМ: ПРОСМОТР БАЗЫ ДАННЫХ ============

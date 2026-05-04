@@ -96,21 +96,23 @@
   - status (TEXT) — running/…
   - note (TEXT)
 
-- tag_raw_terms
+tag_topic_terms (тема → термин, одна строка = один термин)
   - run_id (FK → tag_extraction_runs.id)
-  - subject_id (FK → subjects.id)
-  - term (TEXT) — «сырой» термин
-  - term_norm (generated) — normalize_term(term)
-  - UNIQUE(run_id, subject_id, term_norm)
-
-- tag_raw_assignments
-  - run_id (FK → tag_extraction_runs.id)
-  - subject_id (FK → subjects.id)
+  - subject_id (FK → subjects.id) — предмет темы (например, алгебра)
   - frp_topic_id (FK → frp_topics.id)
-  - source_table (TEXT) — 'skill_defs' | 'content_element_defs'
-  - source_id (INTEGER) — id записи из source_table
   - term / term_norm — «сырой» термин
-  - UNIQUE(run_id, source_table, source_id, term_norm)
+  - processed_at (TIMESTAMPTZ, nullable) — пометка, что термин уже прошёл синонимизацию
+  - processed_run_id (INTEGER, nullable) — id прогона нормализации
+  - UNIQUE(run_id, frp_topic_id, term_norm)
+
+Важно: привязки к skill_defs/content_element_defs на шаге 1 НЕ храним, чтобы не раздувать объём.
+
+
+1.9. Связь канонических тегов с предметами (где встречалось)
+tag_subjects (many-to-many):
+  - tag_id → tags.id
+  - subject_id → subjects.id
+  - PRIMARY KEY(tag_id, subject_id)
 
 
 2) Нормализация терминов (единый принцип)
@@ -159,23 +161,41 @@ normalize_term(x):
 - ВАЖНО: на этом шаге разрешено извлекать и частные, и более общие термины
   (родовые понятия 1–2 уровня вверх), чтобы словарь был максимально полным.
 - Результаты сохраняем в стейджинг:
-  - tag_raw_assignments (привязки запись → term)
-  - tag_raw_terms (уникальный список term для run_id)
+  - tag_topic_terms (тема → term), дубликаты в пределах темы удаляются автоматически (UNIQUE по term_norm).
 
 Промпт: prompts/tag_prompt_1_extract.txt
 
 
 Шаг 2. Нормализация и иерархия
-- Берём уникальный список term из tag_raw_terms (для run_id/subject_id).
-- Просим модель:
-  - сгруппировать синонимы и выбрать каноническую форму,
-  - предложить иерархию canonical tags (child → parent) до 3 уровней.
-- Затем на стороне приложения:
-  - создаём записи в tags (канонические),
-  - создаём tag_aliases (все алиасы → tag_id),
-  - проставляем parent_id в tags по результату иерархии.
+- Берём уникальный список term_norm по выбранному корневому предмету и его детям:
+  SELECT DISTINCT term_norm FROM tag_topic_terms WHERE subject_id IN subtree AND processed_at IS NULL.
 
-Промпт: prompts/tag_prompt_2_normalize.txt
+2A) Синонимизация (чанки)
+- Делаем чанкование (по умолчанию 500 терминов).
+- На каждом чанке модель возвращает canonical-группы: {tag, aliases}.
+- Прогресс пишется в БД (tag_syn_runs + tag_syn_chunks), чтобы можно было продолжить после сбоя.
+- Создаём/обновляем канонические tags в subject_id корневого предмета.
+- Создаём алиасы в tag_aliases (subject_id корневого предмета).
+- Сохраняем, в каких предметах поддерева термин встречался: tag_subjects(tag_id, subject_id).
+- Помечаем обработанные термины в tag_topic_terms.processed_at / processed_run_id.
+
+2B) Merge-pass
+- Берём получившийся список канонических tags и повторяем синонимизацию ещё раз (тоже чанками).
+- Если выяснилось, что два уже созданных канонических tags — синонимы:
+  - выбираем победителя,
+  - проигравшего помечаем is_archived=true (не удаляем),
+  - переносим tag_subjects на победителя,
+  - добавляем alias на победителя.
+
+2C) Иерархизация (отдельный запрос)
+- Модель получает только список канонических tags корневого предмета.
+- Возвращает пары child→parent.
+- Проставляем tags.parent_id.
+- В UI показываем дерево как список с отступами (до 3 уровней).
+
+Промпты:
+- prompts/tag_prompt_2a_synonyms.txt
+- prompts/tag_prompt_2b_hierarchy.txt
 
 
 Шаг 3. Расстановка по готовому словарю
