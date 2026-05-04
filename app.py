@@ -2030,6 +2030,8 @@ for k, v in [
     ('tag_last_result', None),
     ('tag_last_topic_id', None),
     ('tag_costs_by_run', {}),
+    ('tag_batch_running', False),
+    ('tag_batch_stop', False),
     # --- просмотр базы ---
     ('vdb_type', None),
     ('vdb_reassign', False),
@@ -4599,6 +4601,8 @@ elif mode == 'tagging_init':
     with _bcol3:
         if st.button("⛔ Стоп", key='tag_stop_btn', use_container_width=True):
             st.session_state.tag_stop = True
+            st.session_state.tag_batch_running = False
+            st.session_state.tag_batch_stop = True
             st.warning("Остановлено. Вы можете продолжить позже, нажмите «Извлечь теги» на нужной теме.")
 
     def _extract_json_payload(text: str) -> Optional[Dict]:
@@ -4750,11 +4754,12 @@ elif mode == 'tagging_init':
         conn.close()
 
     if st.session_state.get('tag_stop'):
-        st.info("Остановлено. Снимите «Стоп» просто продолжив обработку вручную на нужной теме.")
+        st.info("Остановлено. Чтобы продолжить, просто нажмите «Извлечь теги» (или запустите автопрогон) на нужной теме.")
 
     _act1, _act2, _act3 = st.columns([3, 3, 6])
     with _act1:
         if st.button("✨ Извлечь теги (эта тема)", key='tag_extract_btn', use_container_width=True):
+            st.session_state.tag_stop = False
             records, norm_to_sources, proto_to_norm, total_raw = _load_topic_records_dedup(_cur_topic_id)
             if not records:
                 st.warning("В этой теме нет записей skill_defs/content_element_defs с frp_label.")
@@ -4878,7 +4883,105 @@ elif mode == 'tagging_init':
                     st.error(f"Ошибка очистки: {_e}")
 
     with _act3:
-        st.caption("Совет: если тема слишком большая и ответ не влезает — позже добавим автоматическое разбиение на чанки.")
+        if st.button("✨ Извлечь теги (с этой темы и до конца)", key='tag_extract_from_here_btn', use_container_width=True):
+            st.session_state.tag_stop = False
+            st.session_state.tag_batch_running = True
+            st.session_state.tag_batch_stop = False
+            st.rerun()
+        st.caption("Автопрогон обрабатывает темы по одной и сохраняет после каждой. Если тема слишком большая и ответ не влезает — позже добавим автоматическое разбиение на чанки.")
+
+    # --- Автопрогон: с текущей темы до конца (одна тема за один rerun) ---
+    if st.session_state.get('tag_batch_running'):
+        _bp = int(st.session_state.get('tag_topic_pos', 0))
+        _bt = len(_topics_df)
+
+        _pb_col, _stop_col = st.columns([6, 1])
+        with _pb_col:
+            st.progress(
+                _bp / max(_bt, 1),
+                text=f"Автопрогон: обрабатываю тему {min(_bp + 1, _bt)} / {_bt}… *(нажмите ⛔ чтобы остановить)*",
+            )
+        with _stop_col:
+            if st.button("⛔", key='tag_batch_stop_small', help="Остановить автопрогон", use_container_width=True):
+                st.session_state.tag_batch_running = False
+                st.session_state.tag_batch_stop = True
+                st.warning("Автопрогон остановлен.")
+                st.rerun()
+
+        # процессим текущую тему
+        if _bp < _bt:
+            _topic_row = _topics_df.iloc[_bp].to_dict()
+            _topic_id = int(_topic_row['id'])
+
+            records, norm_to_sources, proto_to_norm, total_raw = _load_topic_records_dedup(_topic_id)
+            if not records:
+                # нет записей — пропускаем тему
+                st.session_state.tag_topic_pos = _bp + 1
+                if _bp + 1 >= _bt:
+                    st.session_state.tag_batch_running = False
+                st.rerun()
+
+            payload = {
+                "subject": _sel_subj,
+                "frp_topic": {
+                    "id": _topic_id,
+                    "grade_class": str(_topic_row.get("grade_class", "")),
+                    "program": str(_topic_row.get("program", "")),
+                    "section": str(_topic_row.get("section", "")),
+                    "topic": str(_topic_row.get("topic", "")),
+                },
+                "records": records,
+            }
+            prompt = load_tag_prompt(1)
+            msgs = [{
+                "role": "user",
+                "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+            }]
+
+            with st.spinner(f"Автопрогон: тема {_bp + 1}/{_bt} (id={_topic_id})…"):
+                resp = call_claude_api(msgs)
+                _accumulate_cost_for_tag_run(_run_id)
+
+            parsed = _extract_json_payload(resp or "")
+            if not parsed or "items" not in parsed:
+                # на ошибке останавливаем, чтобы пользователь мог посмотреть и перезапустить
+                st.session_state.tag_batch_running = False
+                st.session_state.tag_last_result = None
+                st.session_state.tag_last_topic_id = _topic_id
+                st.error("Автопрогон остановлен: не удалось разобрать ответ модели. Проверьте модель/промпт и повторите с этой темы.")
+                st.stop()
+
+            items = parsed.get("items", [])
+            topic_terms_set = set()
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                tags = it.get("tags", [])
+                if not isinstance(tags, list):
+                    continue
+                for tg in tags:
+                    nt = normalize_db_text(tg)
+                    if nt:
+                        topic_terms_set.add(nt)
+            topic_terms = sorted(topic_terms_set)
+            try:
+                _save_topic_terms(_run_id, _sel_subject_id, _topic_id, topic_terms)
+            except Exception as _e:
+                st.session_state.tag_batch_running = False
+                st.error(f"Автопрогон остановлен: ошибка сохранения в БД: {_e}")
+                st.stop()
+
+            # следующий шаг
+            st.session_state.tag_topic_pos = _bp + 1
+            st.session_state.tag_last_result = [{"term": t} for t in topic_terms]
+            st.session_state.tag_last_topic_id = _topic_id
+            if _bp + 1 >= _bt:
+                st.session_state.tag_batch_running = False
+                st.success("Автопрогон завершён.")
+            st.rerun()
+
+        st.session_state.tag_batch_running = False
+        st.rerun()
 
     if st.session_state.get('tag_last_result') and st.session_state.get('tag_last_topic_id') == _cur_topic_id:
         st.markdown("**Последний результат (эта тема):**")
