@@ -1,0 +1,198 @@
+Правила и структура тегирования (Neon PostgreSQL)
+===============================================
+
+Этот файл описывает:
+1) структуру таблиц, которые участвуют в тегировании,
+2) принципы нормализации терминов,
+3) пайплайн тегирования (первичное извлечение → нормализация → расстановка),
+4) как обрабатываются синонимы и новые теги.
+
+
+1) Структура базы данных (ключевые таблицы)
+------------------------------------------
+
+1.1. subjects — справочник предметов (и иерархия предметов)
+- id (SERIAL, PK)
+- name (TEXT) — отображаемое название
+- name_norm (generated) — normalize_term(name) (нижний регистр + схлопнутые пробелы)
+- parent_id (INTEGER, nullable, self-FK) — иерархия предметов
+- is_archived (BOOLEAN) — архивирование вместо удаления
+
+Пример: «математика» — родитель для «алгебра», «алгебра и начала математического анализа»,
+«геометрия», «вероятность и статистика».
+
+
+1.2. frp_topics — темы ФРП (привязка записей навыков/ЭС к теме)
+- id (SERIAL, PK)
+- grade_class (TEXT)
+- subject_id (INTEGER, NOT NULL, FK → subjects.id)
+- subject_name (TEXT) — исходное строковое значение (для совместимости/отладки)
+- section (TEXT)
+- topic (TEXT)
+- program (TEXT) — «базовый» / «профильный»
+
+Уникальность: (grade_class, subject_id, section, topic).
+
+
+1.3. skill_defs — навыки (справочник)
+- id (SERIAL, PK)
+- label_normalized (TEXT) — нормализованный ключ (дедуп)
+- label_display (TEXT) — отображаемый текст
+- frp_label (TEXT) — исходная формулировка из ФРП
+- frp_topic_id (INTEGER, nullable, FK → frp_topics.id)
+- parent_id (INTEGER, nullable, self-FK) — иерархия навыков
+
+
+1.4. content_element_defs — элементы содержания (справочник)
+Структура аналогична skill_defs, включая:
+- frp_label (TEXT)
+- frp_topic_id (INTEGER, nullable, FK → frp_topics.id)
+- parent_id (INTEGER, nullable, self-FK) — иерархия элементов содержания
+
+
+1.5. tags — канонические теги (словарь)
+- id (SERIAL, PK)
+- subject_id (INTEGER, NOT NULL, FK → subjects.id) — теги уникальны внутри subject_id
+- tag (TEXT) — каноническая формулировка тега (нормализуется триггером)
+- parent_id (INTEGER, nullable) — иерархия тегов
+- is_new (BOOLEAN) — «новый/непроверенный» (до ручной проверки)
+- is_archived (BOOLEAN) — архивирование вместо удаления
+- reviewed_at (TIMESTAMPTZ, nullable)
+
+Ключевые ограничения:
+- Уникальность активных тегов: UNIQUE(subject_id, tag) WHERE is_archived=false
+- Иерархия только внутри одного subject_id:
+  FOREIGN KEY (subject_id, parent_id) REFERENCES tags(subject_id, id)
+- DELETE запрещён (вместо этого is_archived=true)
+- Если is_new=false, менять tag нельзя (защита от переименований «принятых» тегов)
+
+
+1.6. tag_aliases — алиасы (синонимы к каноническим тегам)
+- id (SERIAL, PK)
+- subject_id (INTEGER, NOT NULL)
+- alias (TEXT) — альтернативная формулировка (нормализуется триггером)
+- tag_id (INTEGER, NOT NULL) — FK на tags, но «в рамках того же subject_id»
+- is_archived (BOOLEAN) — архивирование вместо удаления
+
+Ограничения:
+- Уникальность активных алиасов: UNIQUE(subject_id, alias) WHERE is_archived=false
+- DELETE запрещён
+
+
+1.7. Таблицы связей (many-to-many)
+- skill_tags(skill_id, tag_id) — PK(skill_id, tag_id), skill_id → skill_defs.id
+- content_tags(content_id, tag_id) — PK(content_id, tag_id), content_id → content_element_defs.id
+
+Примечание: теги не удаляем, поэтому tag_id имеет ON DELETE RESTRICT.
+
+
+1.8. Стейджинг (временное хранение «сырых» результатов до канонизации)
+Нужен, потому что tag_aliases требует tag_id, а на этапе первичного извлечения канонического tag_id ещё нет.
+
+- tag_extraction_runs
+  - id (SERIAL, PK)
+  - subject_id (FK → subjects.id)
+  - program (TEXT)
+  - status (TEXT) — running/…
+  - note (TEXT)
+
+- tag_raw_terms
+  - run_id (FK → tag_extraction_runs.id)
+  - subject_id (FK → subjects.id)
+  - term (TEXT) — «сырой» термин
+  - term_norm (generated) — normalize_term(term)
+  - UNIQUE(run_id, subject_id, term_norm)
+
+- tag_raw_assignments
+  - run_id (FK → tag_extraction_runs.id)
+  - subject_id (FK → subjects.id)
+  - frp_topic_id (FK → frp_topics.id)
+  - source_table (TEXT) — 'skill_defs' | 'content_element_defs'
+  - source_id (INTEGER) — id записи из source_table
+  - term / term_norm — «сырой» термин
+  - UNIQUE(run_id, source_table, source_id, term_norm)
+
+
+2) Нормализация терминов (единый принцип)
+----------------------------------------
+
+normalize_term(x):
+- привести к нижнему регистру,
+- обрезать пробелы по краям,
+- схлопнуть последовательности пробелов внутри в один пробел.
+
+В базе:
+- tags.tag и tag_aliases.alias нормализуются триггерами при INSERT/UPDATE
+- в стейджинге term_norm тоже хранится как generated normalize_term(term)
+
+
+3) Принципы словаря тегов
+------------------------
+
+3.1. Канонический тег
+- не содержит «понятие/свойство/формула/решение/изображение…», только объект;
+- существительное или именная группа, именительный падеж, единственное число;
+- после принятия (is_new=false) формулировка больше не меняется.
+
+3.2. Синонимы
+- все неканонические формулировки хранятся в tag_aliases и указывают на tags.id;
+- поиск существующего канонического тега без участия модели:
+  1) точное совпадение normalize_term(term) с tags.tag (по subject_id)
+  2) иначе совпадение с tag_aliases.alias (по subject_id) → tag_id
+  3) иначе термин считается новым (#new_tag) и попадает на ручную проверку.
+
+3.3. Иерархия тегов
+- parent_id: более конкретный тег ссылается на более общий;
+- глубина не более 3 уровней;
+- родитель и ребёнок должны быть в одном subject_id.
+
+
+4) Пайплайн тегирования (три шага)
+---------------------------------
+
+Шаг 1. Первичное извлечение (по темам frp_topics)
+- Берём одну тему (frp_topic_id) и собираем записи:
+  - skill_defs.frp_label
+  - content_element_defs.frp_label
+  по этой теме.
+- Отдаём модели пачку записей и получаем для каждой записи набор терминов.
+- ВАЖНО: на этом шаге разрешено извлекать и частные, и более общие термины
+  (родовые понятия 1–2 уровня вверх), чтобы словарь был максимально полным.
+- Результаты сохраняем в стейджинг:
+  - tag_raw_assignments (привязки запись → term)
+  - tag_raw_terms (уникальный список term для run_id)
+
+Промпт: prompts/tag_prompt_1_extract.txt
+
+
+Шаг 2. Нормализация и иерархия
+- Берём уникальный список term из tag_raw_terms (для run_id/subject_id).
+- Просим модель:
+  - сгруппировать синонимы и выбрать каноническую форму,
+  - предложить иерархию canonical tags (child → parent) до 3 уровней.
+- Затем на стороне приложения:
+  - создаём записи в tags (канонические),
+  - создаём tag_aliases (все алиасы → tag_id),
+  - проставляем parent_id в tags по результату иерархии.
+
+Промпт: prompts/tag_prompt_2_normalize.txt
+
+
+Шаг 3. Расстановка по готовому словарю
+- Для каждой записи skill_defs / content_element_defs выбираем 1..5 тегов
+  только из словаря (tags + иерархия).
+- Если подходящего тега нет — #new_tag + предложение термина.
+- #new_tag собираются на ручную проверку, затем:
+  - либо добавляем новый канонический tags,
+  - либо добавляем алиас в tag_aliases к существующему tags,
+  - затем повторяем расстановку для записей с #new_tag.
+
+Промпт: prompts/tag_prompt_3_assign.txt
+
+
+5) Практические договорённости
+------------------------------
+- Не удаляем теги и алиасы: используем is_archived=true.
+- Уникальность терминов обеспечиваем в нормализованном виде (lower + пробелы).
+- Для миграций/DDL предпочтительно использовать direct connection или Neon SQL Editor.
+

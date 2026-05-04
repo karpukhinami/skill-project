@@ -4534,31 +4534,87 @@ elif mode == 'tagging_init':
             st.session_state.tag_stop = True
             st.warning("Остановлено. Вы можете продолжить позже, нажмите «Извлечь теги» на нужной теме.")
 
-    def _extract_json_object(text: str) -> Optional[Dict]:
+    def _extract_json_payload(text: str) -> Optional[Dict]:
+        """
+        Извлекает JSON из ответа модели и отрезает лишний текст.
+        Умеет:
+        - снимать ```json fences
+        - доставать самый большой {...} или [...] блок
+        - пытаться дописать закрывающие скобки/кавычки (как в parse_llm_response)
+        """
         if not text:
             return None
-        t = text.strip()
+        t = str(text).strip()
+
         # markdown fences
-        if '```' in t:
-            parts = t.split('```')
+        if "```" in t:
+            parts = t.split("```")
             if len(parts) >= 3:
                 inner = parts[1]
-                lines = inner.split('\n')
-                if lines and lines[0].strip().lower() in ('json', ''):
-                    inner = '\n'.join(lines[1:])
+                lines = inner.split("\n")
+                if lines and lines[0].strip().lower() in ("json", "javascript", ""):
+                    inner = "\n".join(lines[1:])
                 t = inner.strip()
-        m_obj = re.search(r'\{[\s\S]*\}', t)
-        if not m_obj:
-            return None
-        try:
-            return json.loads(m_obj.group())
-        except Exception:
+            else:
+                t = max(parts, key=len).strip()
+
+        def _try_parse(s: str):
+            s = s.strip()
+            try:
+                return json.loads(s)
+            except Exception:
+                pass
+            for closing in ("]", "]}", "}]",
+                            "}", "}}",
+                            "\"]", "\"}", "\"}]"):
+                try:
+                    return json.loads(s + closing)
+                except Exception:
+                    pass
+            last_brace = s.rfind("},")
+            if last_brace == -1:
+                last_brace = s.rfind("}")
+            if last_brace > 0:
+                candidate = s[: last_brace + 1]
+                for wrap in ("", "]", "}"):
+                    try:
+                        return json.loads(candidate + wrap)
+                    except Exception:
+                        pass
             return None
 
-    def _load_topic_records(topic_id: int) -> List[Dict]:
+        # предпочитаем объект {...} (по нашему контракту), но если его нет — пробуем массив
+        obj_matches = re.findall(r"\{[\s\S]*\}", t)
+        arr_matches = re.findall(r"\[[\s\S]*\]", t)
+
+        candidates = []
+        if obj_matches:
+            candidates.extend(obj_matches)
+        if arr_matches:
+            candidates.extend(arr_matches)
+        if not candidates:
+            parsed = _try_parse(t)
+            return parsed if isinstance(parsed, dict) else None
+
+        # берём самый большой блок (обычно это “правильный” JSON)
+        candidates.sort(key=len, reverse=True)
+        for cand in candidates[:3]:
+            parsed = _try_parse(cand)
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    def _load_topic_records_dedup(topic_id: int) -> Tuple[List[Dict], Dict[str, List[Tuple[str, int]]], Dict[Tuple[str, int], str], int]:
+        """
+        Возвращает:
+        - records_for_llm: уникальные по frp_label (по normalize_db_text), чтобы модель не анализировала одно и то же много раз
+        - norm_to_sources: norm_text -> список (source_table, id) всех записей с этим текстом
+        - proto_to_norm: (source_table, id) прототипа -> norm_text (для обратного маппинга ответа модели)
+        - total_raw_records: сколько было записей ДО дедупликации (для UI)
+        """
         conn = get_db_conn()
         if conn is None:
-            return []
+            return [], {}, {}, 0
         try:
             skills = pd.read_sql(
                 "SELECT id, frp_label FROM skill_defs WHERE frp_topic_id = %s AND frp_label IS NOT NULL AND btrim(frp_label) <> '' ORDER BY id",
@@ -4576,14 +4632,35 @@ elif mode == 'tagging_init':
                 conn.close()
             except Exception:
                 pass
-            return []
+            return [], {}, {}, 0
 
-        records: List[Dict] = []
+        raw_rows: List[Tuple[str, int, str]] = []
         for _, r in skills.iterrows():
-            records.append({"source_table": "skill_defs", "id": int(r["id"]), "text": str(r["frp_label"])})
+            raw_rows.append(("skill_defs", int(r["id"]), str(r["frp_label"])))
         for _, r in content.iterrows():
-            records.append({"source_table": "content_element_defs", "id": int(r["id"]), "text": str(r["frp_label"])})
-        return records
+            raw_rows.append(("content_element_defs", int(r["id"]), str(r["frp_label"])))
+
+        total_raw = len(raw_rows)
+
+        # norm_text -> prototype (source_table, id, text)
+        prototypes: Dict[str, Tuple[str, int, str]] = {}
+        norm_to_sources: Dict[str, List[Tuple[str, int]]] = {}
+
+        for src_table, src_id, txt in raw_rows:
+            norm = normalize_db_text(txt)
+            if not norm:
+                continue
+            norm_to_sources.setdefault(norm, []).append((src_table, src_id))
+            if norm not in prototypes:
+                prototypes[norm] = (src_table, src_id, txt.strip())
+
+        records_for_llm: List[Dict] = []
+        proto_to_norm: Dict[Tuple[str, int], str] = {}
+        for norm, (src_table, src_id, txt) in prototypes.items():
+            records_for_llm.append({"source_table": src_table, "id": int(src_id), "text": txt})
+            proto_to_norm[(src_table, int(src_id))] = norm
+
+        return records_for_llm, norm_to_sources, proto_to_norm, total_raw
 
     def _save_extraction(run_id: int, subject_id: int, frp_topic_id: int, items: List[Dict]) -> None:
         conn = get_db_conn()
@@ -4625,10 +4702,14 @@ elif mode == 'tagging_init':
     _act1, _act2, _act3 = st.columns([3, 3, 6])
     with _act1:
         if st.button("✨ Извлечь теги (эта тема)", key='tag_extract_btn', use_container_width=True):
-            records = _load_topic_records(_cur_topic_id)
+            records, norm_to_sources, proto_to_norm, total_raw = _load_topic_records_dedup(_cur_topic_id)
             if not records:
                 st.warning("В этой теме нет записей skill_defs/content_element_defs с frp_label.")
             else:
+                st.info(
+                    f"Отправляю в модель: **{len(records)}** уникальных формулировок frp_label "
+                    f"(всего записей в теме: **{total_raw}**)."
+                )
                 payload = {
                     "subject": _sel_subj,
                     "frp_topic": {
@@ -4643,18 +4724,22 @@ elif mode == 'tagging_init':
                 prompt = load_tag_prompt(1)
                 msgs = [{
                     "role": "user",
-                    "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+                    # без indent, чтобы не раздувать запрос
+                    "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
                 }]
                 with st.spinner("Запрос к модели..."):
                     resp = call_claude_api(msgs)
                     _accumulate_cost()
-                parsed = _extract_json_object(resp or "")
+                parsed = _extract_json_payload(resp or "")
                 if not parsed or "items" not in parsed:
                     st.error("Не удалось разобрать ответ модели. Попробуйте ещё раз или поменяйте модель.")
                 else:
                     items = parsed.get("items", [])
                     # лёгкая валидация
-                    ok_items = []
+                    ok_items: List[Dict] = []
+                    expected_proto_keys = set(proto_to_norm.keys())
+                    matched_proto_keys = set()
+                    unexpected_items = 0
                     for it in items:
                         if not isinstance(it, dict):
                             continue
@@ -4665,11 +4750,28 @@ elif mode == 'tagging_init':
                         tags = it.get("tags", [])
                         if not isinstance(tags, list) or not tags:
                             continue
-                        ok_items.append({
-                            "source_table": it["source_table"],
-                            "id": int(it["id"]),
-                            "tags": [normalize_db_text(x) for x in tags if normalize_db_text(x)]
-                        })
+
+                        src_table = str(it["source_table"])
+                        src_id = int(it["id"])
+                        norm = proto_to_norm.get((src_table, src_id))
+                        if not norm:
+                            # если модель вернула неожиданный id/таблицу — пропускаем
+                            unexpected_items += 1
+                            continue
+                        matched_proto_keys.add((src_table, src_id))
+
+                        cleaned_tags = [normalize_db_text(x) for x in tags if normalize_db_text(x)]
+                        if not cleaned_tags:
+                            continue
+
+                        # расширяем на ВСЕ записи с таким же frp_label (дедуп по norm)
+                        for dst_table, dst_id in norm_to_sources.get(norm, []):
+                            ok_items.append({
+                                "source_table": dst_table,
+                                "id": int(dst_id),
+                                "tags": cleaned_tags,
+                            })
+
                     if not ok_items:
                         st.error("Ответ модели не содержит корректных items.")
                     else:
@@ -4677,7 +4779,17 @@ elif mode == 'tagging_init':
                             _save_extraction(_run_id, _sel_subject_id, _cur_topic_id, ok_items)
                             st.session_state.tag_last_result = ok_items
                             st.session_state.tag_last_topic_id = _cur_topic_id
-                            st.success(f"Сохранено: {len(ok_items)} записей (привязки + термины).")
+                            st.success(
+                                f"Сохранено: {len(ok_items)} записей (привязки + термины). "
+                                f"Уникальных frp_label отправлено в модель: {len(records)}."
+                            )
+                            missing = len(expected_proto_keys - matched_proto_keys)
+                            covered = len(matched_proto_keys)
+                            if missing > 0 or unexpected_items > 0:
+                                st.warning(
+                                    f"Покрытие ответа: {covered}/{len(expected_proto_keys)} уникальных frp_label. "
+                                    f"Не покрыто: {missing}. Неожиданных items: {unexpected_items}."
+                                )
                         except Exception as _e:
                             st.error(f"Ошибка сохранения в БД: {_e}")
 
