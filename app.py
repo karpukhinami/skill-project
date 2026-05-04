@@ -43,17 +43,38 @@ def load_frp_topics_cached() -> pd.DataFrame:
     """Загружает frp_topics из БД и кэширует на 5 минут."""
     conn = get_db_conn()
     if conn is None:
-        return pd.DataFrame(columns=['id', 'grade_class', 'subject', 'section', 'topic', 'program'])
+        return pd.DataFrame(columns=['id', 'grade_class', 'subject_id', 'subject', 'section', 'topic', 'program'])
     try:
         df = pd.read_sql(
-            "SELECT id, grade_class, subject, section, topic, program FROM frp_topics ORDER BY grade_class, subject, section, topic",
+            "SELECT f.id, f.grade_class, f.subject_id, s.name AS subject, f.section, f.topic, f.program "
+            "FROM frp_topics f "
+            "JOIN subjects s ON f.subject_id = s.id "
+            "ORDER BY f.grade_class, s.name, f.section, f.topic",
             conn
         )
         conn.close()
         return df
     except Exception:
         conn.close()
-        return pd.DataFrame(columns=['id', 'grade_class', 'subject', 'section', 'topic', 'program'])
+        return pd.DataFrame(columns=['id', 'grade_class', 'subject_id', 'subject', 'section', 'topic', 'program'])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_subjects_cached() -> pd.DataFrame:
+    """Загружает subjects из БД и кэширует на 5 минут."""
+    conn = get_db_conn()
+    if conn is None:
+        return pd.DataFrame(columns=['id', 'name', 'parent_id'])
+    try:
+        df = pd.read_sql(
+            "SELECT id, name, parent_id FROM subjects WHERE is_archived = FALSE ORDER BY name",
+            conn
+        )
+        conn.close()
+        return df
+    except Exception:
+        conn.close()
+        return pd.DataFrame(columns=['id', 'name', 'parent_id'])
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -71,12 +92,13 @@ def load_view_data_cached(table: str) -> pd.DataFrame:
                        s.label_normalized,
                        s.frp_label,
                        s.frp_topic_id,
-                       COALESCE(f.subject,     '(без предмета)') AS subject,
+                       COALESCE(sub.name,      '(без предмета)') AS subject,
                        COALESCE(f.grade_class, '—')              AS grade_class,
                        COALESCE(f.section,     '(без раздела)')  AS section,
                        COALESCE(f.topic,       '(без темы)')     AS topic
                 FROM {table} s
                 LEFT JOIN frp_topics f ON s.frp_topic_id = f.id
+                LEFT JOIN subjects sub ON f.subject_id = sub.id
             """)
             rows = cur.fetchall()
             cols  = [d[0] for d in cur.description]
@@ -3842,7 +3864,20 @@ elif mode == 'db_input':
     _col1, _col2, _col3, _col4 = st.columns(4)
 
     # Предмет
-    subjects = sorted(frp_df['subject'].unique())
+    subjects_df = load_subjects_cached()
+    if not subjects_df.empty:
+        subjects = sorted(subjects_df['name'].unique())
+        subject_id_map = (
+            subjects_df[['name', 'id']]
+            .drop_duplicates()
+            .set_index('name')['id']
+            .to_dict()
+        )
+    else:
+        # fallback: если subjects ещё не создана в БД
+        subjects = sorted(frp_df['subject'].unique())
+        subject_id_map = {}
+
     sel_subj = _col1.selectbox("Предмет", [''] + subjects, key='db_sel_subject')
 
     # Класс — фильтрованный по предмету
@@ -3913,7 +3948,7 @@ elif mode == 'db_input':
         with st.container(border=True):
             st.markdown("**Новая тема ФРП**")
             _f1, _f2, _f3, _f4 = st.columns(4)
-            new_subj    = _f1.text_input("Предмет",  value=sel_subj or '',    key='db_new_subj')
+            new_subj    = _f1.selectbox("Предмет",  subjects, index=(subjects.index(sel_subj) if sel_subj in subjects else 0), key='db_new_subj')
             new_class   = _f2.text_input("Класс",    value=sel_class or '',   key='db_new_class')
             new_section = _f3.text_input("Раздел",   value=sel_section or '', key='db_new_section')
             new_topic   = _f4.text_input("Тема",     value=sel_topic or '',   key='db_new_topic')
@@ -3933,11 +3968,15 @@ elif mode == 'db_input':
                         _conn = get_db_conn()
                         if _conn:
                             try:
+                                _subject_id = subject_id_map.get(_ns)
+                                if not _subject_id:
+                                    st.error("Не найден subject_id для выбранного предмета. Проверьте таблицу subjects.")
+                                    raise RuntimeError("subject_id not found")
                                 _cur = _conn.cursor()
                                 _cur.execute(
-                                    "INSERT INTO frp_topics (grade_class, subject, section, topic, program) "
-                                    "VALUES (%s,%s,%s,%s,%s) RETURNING id",
-                                    (_nc, _ns, _nse, _nt, 'базовый')
+                                    "INSERT INTO frp_topics (grade_class, subject_id, subject_name, section, topic, program) "
+                                    "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                                    (_nc, int(_subject_id), _ns, _nse, _nt, 'базовый')
                                 )
                                 _new_id = _cur.fetchone()[0]
                                 _conn.commit()
