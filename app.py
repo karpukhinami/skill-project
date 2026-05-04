@@ -1591,6 +1591,31 @@ def _accumulate_cost():
     st.session_state['db_cost_usd']           = st.session_state.get('db_cost_usd', 0.0) + cost_usd
     st.session_state['_last_claude_usage']    = None
 
+
+def _accumulate_cost_for_tag_run(run_id: Optional[int]):
+    """Считывает _last_claude_usage и прибавляет к счётчикам затрат текущего прогона тегирования."""
+    usage = st.session_state.get('_last_claude_usage')
+    if not usage or not run_id:
+        return
+
+    model_key = usage.get('model_key', st.session_state.get('selected_model_key', 'claude_direct'))
+    prices = _get_model_prices(model_key)
+    in_tok = int(usage.get('input_tokens', 0) or 0)
+    out_tok = int(usage.get('output_tokens', 0) or 0)
+    cost_usd = (in_tok * prices['input'] + out_tok * prices['output']) / 1_000_000
+
+    # Храним суммы в session_state по run_id (чтобы копилось в течение прогона).
+    costs = st.session_state.get('tag_costs_by_run', {})
+    key = str(int(run_id))
+    prev = costs.get(key, {'input_tokens': 0, 'output_tokens': 0, 'usd': 0.0})
+    prev['input_tokens'] = int(prev.get('input_tokens', 0)) + in_tok
+    prev['output_tokens'] = int(prev.get('output_tokens', 0)) + out_tok
+    prev['usd'] = float(prev.get('usd', 0.0)) + float(cost_usd)
+    costs[key] = prev
+    st.session_state['tag_costs_by_run'] = costs
+
+    st.session_state['_last_claude_usage'] = None
+
 def group_content_by_structure(data_dict: Dict) -> Dict:
     """Группирует записи содержания по предмету -> класс -> раздел -> тема."""
     grouped = {}
@@ -1914,6 +1939,23 @@ section[data-testid="stSidebar"] div[role="radiogroup"] > label > div[data-basew
         st.metric("Стоимость, ₽", f"{_usd * 90:.2f} ₽")
         st.caption("Сбрасывается при сохранении в базу")
 
+    # --- Затраты на LLM (текущий прогон тегирования) ---
+    _tag_run_id = st.session_state.get('tag_run_id')
+    _tag_costs = st.session_state.get('tag_costs_by_run', {})
+    _tag_key = str(int(_tag_run_id)) if _tag_run_id else None
+    if _tag_key and isinstance(_tag_costs, dict) and _tag_key in _tag_costs:
+        _tc = _tag_costs.get(_tag_key) or {}
+        _tin = int(_tc.get('input_tokens', 0) or 0)
+        _tout = int(_tc.get('output_tokens', 0) or 0)
+        _tusd = float(_tc.get('usd', 0.0) or 0.0)
+        if _tin > 0 or _tout > 0:
+            st.markdown("---")
+            st.markdown(f"**🏷️💰 Затраты (прогон run_id={_tag_key})**")
+            st.caption(f"Входящие токены: {_tin:,}")
+            st.caption(f"Исходящие токены: {_tout:,}")
+            st.metric("Стоимость, USD", f"${_tusd:.4f}")
+            st.metric("Стоимость, ₽", f"{_tusd * 90:.2f} ₽")
+
 # Инициализация session_state
 for k, v in [
     ('mode', 'frp_table'),
@@ -1987,6 +2029,7 @@ for k, v in [
     ('tag_stop', False),
     ('tag_last_result', None),
     ('tag_last_topic_id', None),
+    ('tag_costs_by_run', {}),
     # --- просмотр базы ---
     ('vdb_type', None),
     ('vdb_reassign', False),
@@ -4739,7 +4782,7 @@ elif mode == 'tagging_init':
                 }]
                 with st.spinner("Запрос к модели..."):
                     resp = call_claude_api(msgs)
-                    _accumulate_cost()
+                    _accumulate_cost_for_tag_run(_run_id)
                 parsed = _extract_json_payload(resp or "")
                 if not parsed or "items" not in parsed:
                     st.error("Не удалось разобрать ответ модели. Попробуйте ещё раз или поменяйте модель.")
