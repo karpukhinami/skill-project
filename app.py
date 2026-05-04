@@ -4516,9 +4516,33 @@ elif mode == 'tagging_init':
     _cur_topic = _topics_df.iloc[_pos].to_dict()
     _cur_topic_id = int(_cur_topic['id'])
 
-    _pcol, _bcol1, _bcol2, _bcol3 = st.columns([6, 2, 2, 2])
+    def _get_saved_terms_count(run_id: int, frp_topic_id: int) -> int:
+        conn = get_db_conn()
+        if conn is None:
+            return 0
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM tag_topic_terms WHERE run_id=%s AND frp_topic_id=%s",
+                    (int(run_id), int(frp_topic_id)),
+                )
+                cnt = int(cur.fetchone()[0])
+            conn.close()
+            return cnt
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return 0
+
+    _saved_terms_cnt = _get_saved_terms_count(_run_id, _cur_topic_id)
+
+    _pcol, _mcol, _bcol1, _bcol2, _bcol3 = st.columns([6, 2, 2, 2, 2])
     with _pcol:
         st.progress((_pos) / max(_total, 1), text=f"Тема {_pos + 1} / {_total}: id={_cur_topic_id} — {_cur_topic.get('section','')} / {_cur_topic.get('topic','')}")
+    with _mcol:
+        st.metric("Сохранено терминов", _saved_terms_cnt)
     with _bcol1:
         if st.button("⬅️ Назад", key='tag_prev_topic', disabled=_pos <= 0, use_container_width=True):
             st.session_state.tag_topic_pos = _pos - 1
