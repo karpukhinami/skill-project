@@ -4521,6 +4521,24 @@ elif mode == 'tagging_init':
 
     _sel_subject_id = int(_subj_name_to_id.get(_sel_subj))
 
+    def _latest_tag_extraction_run_id() -> Optional[int]:
+        """Последний прогон первичного извлечения (для нормализации, если в сессии run не выбран)."""
+        conn = get_db_conn()
+        if conn is None:
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM tag_extraction_runs ORDER BY id DESC LIMIT 1")
+                row = cur.fetchone()
+            conn.close()
+            return int(row[0]) if row else None
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return None
+
     def _load_topics_df(subject_id: int, program: str) -> pd.DataFrame:
         conn = get_db_conn()
         if conn is None:
@@ -4565,15 +4583,15 @@ elif mode == 'tagging_init':
         st.session_state.tag_topic_df = _load_topics_df(_sel_subject_id, _sel_program)
 
     _topics_df = st.session_state.tag_topic_df
-    if _topics_df is None or _topics_df.empty:
+    _has_topics = _topics_df is not None and not _topics_df.empty
+    if not _has_topics:
         st.warning("Нет тем для выбранного предмета/программы (или нет записей в skill_defs/content_element_defs).")
-        st.stop()
-
-    st.dataframe(
-        _topics_df[['id', 'grade_class', 'section', 'topic', 'program', 'skills_cnt', 'content_cnt', 'total_cnt']],
-        use_container_width=True,
-        hide_index=True,
-    )
+    else:
+        st.dataframe(
+            _topics_df[['id', 'grade_class', 'section', 'topic', 'program', 'skills_cnt', 'content_cnt', 'total_cnt']],
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.markdown("---")
 
@@ -4609,459 +4627,470 @@ elif mode == 'tagging_init':
                     st.error(f"Не удалось создать прогон: {_e}")
 
     with _run_col2:
-        _run_id = st.session_state.get('tag_run_id')
-        st.metric("Текущий run_id", str(_run_id) if _run_id else "—")
+        _rid_display = st.session_state.get('tag_run_id')
+        st.metric("Текущий run_id (сессия)", str(_rid_display) if _rid_display else "—")
 
     with _run_col3:
         st.caption("Если закрыли страницу — прогон можно продолжить: run_id хранится в сессии браузера. Позже добавим выбор/резюмирование по run_id из БД.")
 
-    if not st.session_state.get('tag_run_id'):
-        st.info("Создайте новый прогон, чтобы сохранять результаты извлечения.")
-        st.stop()
+    if st.session_state.get('tag_run_id'):
+        _run_id = int(st.session_state.tag_run_id)
+    else:
+        _run_id = _latest_tag_extraction_run_id()
+        if _run_id is not None:
+            st.info(
+                f"Прогон в сессии не создан — первичное извлечение по темам ниже недоступно, пока не нажмёте «Начать новый прогон». "
+                f"Блок нормализации использует последний прогон в БД: **run_id={_run_id}**."
+            )
+        else:
+            st.info("Создайте новый прогон, чтобы сохранять результаты извлечения. В БД пока нет строк в tag_extraction_runs — нормализовать нечего.")
 
-    _run_id = int(st.session_state.tag_run_id)
+    _show_topic_extraction = bool(st.session_state.get('tag_run_id')) and _has_topics
+    if st.session_state.get('tag_run_id') and not _has_topics:
+        st.warning("Прогон есть, но для выбранного предмета/программы нет тем — смените фильтры или снимите «Только темы с записями».")
 
-    _pos = int(st.session_state.get('tag_topic_pos', 0))
-    _total = len(_topics_df)
-    _pos = max(0, min(_pos, max(_total - 1, 0)))
-    st.session_state.tag_topic_pos = _pos
+    if _show_topic_extraction:
+        _pos = int(st.session_state.get('tag_topic_pos', 0))
+        _total = len(_topics_df)
+        _pos = max(0, min(_pos, max(_total - 1, 0)))
+        st.session_state.tag_topic_pos = _pos
 
-    _cur_topic = _topics_df.iloc[_pos].to_dict()
-    _cur_topic_id = int(_cur_topic['id'])
+        _cur_topic = _topics_df.iloc[_pos].to_dict()
+        _cur_topic_id = int(_cur_topic['id'])
 
-    def _get_saved_terms_count(run_id: int, frp_topic_id: int) -> int:
-        conn = get_db_conn()
-        if conn is None:
-            return 0
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) FROM tag_topic_terms WHERE run_id=%s AND frp_topic_id=%s",
-                    (int(run_id), int(frp_topic_id)),
-                )
-                cnt = int(cur.fetchone()[0])
-            conn.close()
-            return cnt
-        except Exception:
+        def _get_saved_terms_count(run_id: int, frp_topic_id: int) -> int:
+            conn = get_db_conn()
+            if conn is None:
+                return 0
             try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM tag_topic_terms WHERE run_id=%s AND frp_topic_id=%s",
+                        (int(run_id), int(frp_topic_id)),
+                    )
+                    cnt = int(cur.fetchone()[0])
                 conn.close()
+                return cnt
             except Exception:
-                pass
-            return 0
-
-    _saved_terms_cnt = _get_saved_terms_count(_run_id, _cur_topic_id)
-
-    _pcol, _mcol, _bcol1, _bcol2, _bcol3 = st.columns([6, 2, 2, 2, 2])
-    with _pcol:
-        st.progress((_pos) / max(_total, 1), text=f"Тема {_pos + 1} / {_total}: id={_cur_topic_id} — {_cur_topic.get('section','')} / {_cur_topic.get('topic','')}")
-    with _mcol:
-        st.metric("Сохранено терминов", _saved_terms_cnt)
-    with _bcol1:
-        if st.button("⬅️ Назад", key='tag_prev_topic', disabled=_pos <= 0, use_container_width=True):
-            st.session_state.tag_topic_pos = _pos - 1
-            st.session_state.tag_last_result = None
-            st.rerun()
-    with _bcol2:
-        if st.button("➡️ Вперёд", key='tag_next_topic', disabled=_pos >= _total - 1, use_container_width=True):
-            st.session_state.tag_topic_pos = _pos + 1
-            st.session_state.tag_last_result = None
-            st.rerun()
-    with _bcol3:
-        if st.button("⛔ Стоп", key='tag_stop_btn', use_container_width=True):
-            st.session_state.tag_stop = True
-            st.session_state.tag_batch_running = False
-            st.session_state.tag_batch_stop = True
-            st.warning("Остановлено. Вы можете продолжить позже, нажмите «Извлечь теги» на нужной теме.")
-
-    def _extract_json_payload(text: str) -> Optional[Dict]:
-        """
-        Извлекает JSON из ответа модели и отрезает лишний текст.
-        Умеет:
-        - снимать ```json fences
-        - доставать самый большой {...} или [...] блок
-        - пытаться дописать закрывающие скобки/кавычки (как в parse_llm_response)
-        """
-        if not text:
-            return None
-        t = str(text).strip()
-
-        # markdown fences
-        if "```" in t:
-            parts = t.split("```")
-            if len(parts) >= 3:
-                inner = parts[1]
-                lines = inner.split("\n")
-                if lines and lines[0].strip().lower() in ("json", "javascript", ""):
-                    inner = "\n".join(lines[1:])
-                t = inner.strip()
-            else:
-                t = max(parts, key=len).strip()
-
-        def _try_parse(s: str):
-            s = s.strip()
-            try:
-                return json.loads(s)
-            except Exception:
-                pass
-            for closing in ("]", "]}", "}]",
-                            "}", "}}",
-                            "\"]", "\"}", "\"}]"):
                 try:
-                    return json.loads(s + closing)
+                    conn.close()
                 except Exception:
                     pass
-            last_brace = s.rfind("},")
-            if last_brace == -1:
-                last_brace = s.rfind("}")
-            if last_brace > 0:
-                candidate = s[: last_brace + 1]
-                for wrap in ("", "]", "}"):
+                return 0
+
+        _saved_terms_cnt = _get_saved_terms_count(_run_id, _cur_topic_id)
+
+        _pcol, _mcol, _bcol1, _bcol2, _bcol3 = st.columns([6, 2, 2, 2, 2])
+        with _pcol:
+            st.progress((_pos) / max(_total, 1), text=f"Тема {_pos + 1} / {_total}: id={_cur_topic_id} — {_cur_topic.get('section','')} / {_cur_topic.get('topic','')}")
+        with _mcol:
+            st.metric("Сохранено терминов", _saved_terms_cnt)
+        with _bcol1:
+            if st.button("⬅️ Назад", key='tag_prev_topic', disabled=_pos <= 0, use_container_width=True):
+                st.session_state.tag_topic_pos = _pos - 1
+                st.session_state.tag_last_result = None
+                st.rerun()
+        with _bcol2:
+            if st.button("➡️ Вперёд", key='tag_next_topic', disabled=_pos >= _total - 1, use_container_width=True):
+                st.session_state.tag_topic_pos = _pos + 1
+                st.session_state.tag_last_result = None
+                st.rerun()
+        with _bcol3:
+            if st.button("⛔ Стоп", key='tag_stop_btn', use_container_width=True):
+                st.session_state.tag_stop = True
+                st.session_state.tag_batch_running = False
+                st.session_state.tag_batch_stop = True
+                st.warning("Остановлено. Вы можете продолжить позже, нажмите «Извлечь теги» на нужной теме.")
+
+        def _extract_json_payload(text: str) -> Optional[Dict]:
+            """
+            Извлекает JSON из ответа модели и отрезает лишний текст.
+            Умеет:
+            - снимать ```json fences
+            - доставать самый большой {...} или [...] блок
+            - пытаться дописать закрывающие скобки/кавычки (как в parse_llm_response)
+            """
+            if not text:
+                return None
+            t = str(text).strip()
+
+            # markdown fences
+            if "```" in t:
+                parts = t.split("```")
+                if len(parts) >= 3:
+                    inner = parts[1]
+                    lines = inner.split("\n")
+                    if lines and lines[0].strip().lower() in ("json", "javascript", ""):
+                        inner = "\n".join(lines[1:])
+                    t = inner.strip()
+                else:
+                    t = max(parts, key=len).strip()
+
+            def _try_parse(s: str):
+                s = s.strip()
+                try:
+                    return json.loads(s)
+                except Exception:
+                    pass
+                for closing in ("]", "]}", "}]",
+                                "}", "}}",
+                                "\"]", "\"}", "\"}]"):
                     try:
-                        return json.loads(candidate + wrap)
+                        return json.loads(s + closing)
                     except Exception:
                         pass
+                last_brace = s.rfind("},")
+                if last_brace == -1:
+                    last_brace = s.rfind("}")
+                if last_brace > 0:
+                    candidate = s[: last_brace + 1]
+                    for wrap in ("", "]", "}"):
+                        try:
+                            return json.loads(candidate + wrap)
+                        except Exception:
+                            pass
+                return None
+
+            # предпочитаем объект {...} (по нашему контракту), но если его нет — пробуем массив
+            obj_matches = re.findall(r"\{[\s\S]*\}", t)
+            arr_matches = re.findall(r"\[[\s\S]*\]", t)
+
+            candidates = []
+            if obj_matches:
+                candidates.extend(obj_matches)
+            if arr_matches:
+                candidates.extend(arr_matches)
+            if not candidates:
+                parsed = _try_parse(t)
+                return parsed if isinstance(parsed, dict) else None
+
+            # берём самый большой блок (обычно это “правильный” JSON)
+            candidates.sort(key=len, reverse=True)
+            for cand in candidates[:3]:
+                parsed = _try_parse(cand)
+                if isinstance(parsed, dict):
+                    return parsed
             return None
 
-        # предпочитаем объект {...} (по нашему контракту), но если его нет — пробуем массив
-        obj_matches = re.findall(r"\{[\s\S]*\}", t)
-        arr_matches = re.findall(r"\[[\s\S]*\]", t)
-
-        candidates = []
-        if obj_matches:
-            candidates.extend(obj_matches)
-        if arr_matches:
-            candidates.extend(arr_matches)
-        if not candidates:
-            parsed = _try_parse(t)
-            return parsed if isinstance(parsed, dict) else None
-
-        # берём самый большой блок (обычно это “правильный” JSON)
-        candidates.sort(key=len, reverse=True)
-        for cand in candidates[:3]:
-            parsed = _try_parse(cand)
-            if isinstance(parsed, dict):
-                return parsed
-        return None
-
-    def _load_topic_records_dedup(topic_id: int) -> Tuple[List[Dict], Dict[str, List[Tuple[str, int]]], Dict[Tuple[str, int], str], int]:
-        """
-        Возвращает:
-        - records_for_llm: уникальные по frp_label (по normalize_db_text), чтобы модель не анализировала одно и то же много раз
-        - norm_to_sources: norm_text -> список (source_table, id) всех записей с этим текстом
-        - proto_to_norm: (source_table, id) прототипа -> norm_text (для обратного маппинга ответа модели)
-        - total_raw_records: сколько было записей ДО дедупликации (для UI)
-        """
-        conn = get_db_conn()
-        if conn is None:
-            return [], {}, {}, 0
-        try:
-            skills = pd.read_sql(
-                "SELECT id, frp_label FROM skill_defs WHERE frp_topic_id = %s AND frp_label IS NOT NULL AND btrim(frp_label) <> '' ORDER BY id",
-                conn,
-                params=(topic_id,),
-            )
-            content = pd.read_sql(
-                "SELECT id, frp_label FROM content_element_defs WHERE frp_topic_id = %s AND frp_label IS NOT NULL AND btrim(frp_label) <> '' ORDER BY id",
-                conn,
-                params=(topic_id,),
-            )
-            conn.close()
-        except Exception:
+        def _load_topic_records_dedup(topic_id: int) -> Tuple[List[Dict], Dict[str, List[Tuple[str, int]]], Dict[Tuple[str, int], str], int]:
+            """
+            Возвращает:
+            - records_for_llm: уникальные по frp_label (по normalize_db_text), чтобы модель не анализировала одно и то же много раз
+            - norm_to_sources: norm_text -> список (source_table, id) всех записей с этим текстом
+            - proto_to_norm: (source_table, id) прототипа -> norm_text (для обратного маппинга ответа модели)
+            - total_raw_records: сколько было записей ДО дедупликации (для UI)
+            """
+            conn = get_db_conn()
+            if conn is None:
+                return [], {}, {}, 0
             try:
+                skills = pd.read_sql(
+                    "SELECT id, frp_label FROM skill_defs WHERE frp_topic_id = %s AND frp_label IS NOT NULL AND btrim(frp_label) <> '' ORDER BY id",
+                    conn,
+                    params=(topic_id,),
+                )
+                content = pd.read_sql(
+                    "SELECT id, frp_label FROM content_element_defs WHERE frp_topic_id = %s AND frp_label IS NOT NULL AND btrim(frp_label) <> '' ORDER BY id",
+                    conn,
+                    params=(topic_id,),
+                )
                 conn.close()
             except Exception:
-                pass
-            return [], {}, {}, 0
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return [], {}, {}, 0
 
-        raw_rows: List[Tuple[str, int, str]] = []
-        for _, r in skills.iterrows():
-            raw_rows.append(("skill_defs", int(r["id"]), str(r["frp_label"])))
-        for _, r in content.iterrows():
-            raw_rows.append(("content_element_defs", int(r["id"]), str(r["frp_label"])))
+            raw_rows: List[Tuple[str, int, str]] = []
+            for _, r in skills.iterrows():
+                raw_rows.append(("skill_defs", int(r["id"]), str(r["frp_label"])))
+            for _, r in content.iterrows():
+                raw_rows.append(("content_element_defs", int(r["id"]), str(r["frp_label"])))
 
-        total_raw = len(raw_rows)
+            total_raw = len(raw_rows)
 
-        # norm_text -> prototype (source_table, id, text)
-        prototypes: Dict[str, Tuple[str, int, str]] = {}
-        norm_to_sources: Dict[str, List[Tuple[str, int]]] = {}
+            # norm_text -> prototype (source_table, id, text)
+            prototypes: Dict[str, Tuple[str, int, str]] = {}
+            norm_to_sources: Dict[str, List[Tuple[str, int]]] = {}
 
-        for src_table, src_id, txt in raw_rows:
-            norm = normalize_db_text(txt)
-            if not norm:
-                continue
-            norm_to_sources.setdefault(norm, []).append((src_table, src_id))
-            if norm not in prototypes:
-                prototypes[norm] = (src_table, src_id, txt.strip())
-
-        records_for_llm: List[Dict] = []
-        proto_to_norm: Dict[Tuple[str, int], str] = {}
-        for norm, (src_table, src_id, txt) in prototypes.items():
-            records_for_llm.append({"source_table": src_table, "id": int(src_id), "text": txt})
-            proto_to_norm[(src_table, int(src_id))] = norm
-
-        return records_for_llm, norm_to_sources, proto_to_norm, total_raw
-
-    def _save_topic_terms(run_id: int, subject_id: int, frp_topic_id: int, terms: List[str]) -> None:
-        conn = get_db_conn()
-        if conn is None:
-            raise RuntimeError("Нет подключения к БД")
-        with conn.cursor() as cur:
-            for term in terms:
-                t = normalize_db_text(term)
-                if not t:
+            for src_table, src_id, txt in raw_rows:
+                norm = normalize_db_text(txt)
+                if not norm:
                     continue
-                cur.execute(
-                    """
-                    INSERT INTO tag_topic_terms(run_id, subject_id, frp_topic_id, term)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (run_id, frp_topic_id, term_norm) DO NOTHING
-                    """,
-                    (run_id, subject_id, frp_topic_id, t),
-                )
-        conn.commit()
-        conn.close()
+                norm_to_sources.setdefault(norm, []).append((src_table, src_id))
+                if norm not in prototypes:
+                    prototypes[norm] = (src_table, src_id, txt.strip())
 
-    if st.session_state.get('tag_stop'):
-        st.info("Остановлено. Чтобы продолжить, просто нажмите «Извлечь теги» (или запустите автопрогон) на нужной теме.")
+            records_for_llm: List[Dict] = []
+            proto_to_norm: Dict[Tuple[str, int], str] = {}
+            for norm, (src_table, src_id, txt) in prototypes.items():
+                records_for_llm.append({"source_table": src_table, "id": int(src_id), "text": txt})
+                proto_to_norm[(src_table, int(src_id))] = norm
 
-    _act1, _act2, _act3 = st.columns([3, 3, 6])
-    with _act1:
-        if st.button("✨ Извлечь теги (эта тема)", key='tag_extract_btn', use_container_width=True):
-            st.session_state.tag_stop = False
-            records, norm_to_sources, proto_to_norm, total_raw = _load_topic_records_dedup(_cur_topic_id)
-            if not records:
-                st.warning("В этой теме нет записей skill_defs/content_element_defs с frp_label.")
-            else:
-                st.info(
-                    f"Отправляю в модель: **{len(records)}** уникальных формулировок frp_label "
-                    f"(всего записей в теме: **{total_raw}**)."
+            return records_for_llm, norm_to_sources, proto_to_norm, total_raw
+
+        def _save_topic_terms(run_id: int, subject_id: int, frp_topic_id: int, terms: List[str]) -> None:
+            conn = get_db_conn()
+            if conn is None:
+                raise RuntimeError("Нет подключения к БД")
+            with conn.cursor() as cur:
+                for term in terms:
+                    t = normalize_db_text(term)
+                    if not t:
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO tag_topic_terms(run_id, subject_id, frp_topic_id, term)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (run_id, frp_topic_id, term_norm) DO NOTHING
+                        """,
+                        (run_id, subject_id, frp_topic_id, t),
+                    )
+            conn.commit()
+            conn.close()
+
+        if st.session_state.get('tag_stop'):
+            st.info("Остановлено. Чтобы продолжить, просто нажмите «Извлечь теги» (или запустите автопрогон) на нужной теме.")
+
+        _act1, _act2, _act3 = st.columns([3, 3, 6])
+        with _act1:
+            if st.button("✨ Извлечь теги (эта тема)", key='tag_extract_btn', use_container_width=True):
+                st.session_state.tag_stop = False
+                records, norm_to_sources, proto_to_norm, total_raw = _load_topic_records_dedup(_cur_topic_id)
+                if not records:
+                    st.warning("В этой теме нет записей skill_defs/content_element_defs с frp_label.")
+                else:
+                    st.info(
+                        f"Отправляю в модель: **{len(records)}** уникальных формулировок frp_label "
+                        f"(всего записей в теме: **{total_raw}**)."
+                    )
+                    payload = {
+                        "subject": _sel_subj,
+                        "frp_topic": {
+                            "id": _cur_topic_id,
+                            "grade_class": str(_cur_topic.get("grade_class", "")),
+                            "program": str(_cur_topic.get("program", "")),
+                            "section": str(_cur_topic.get("section", "")),
+                            "topic": str(_cur_topic.get("topic", "")),
+                        },
+                        "records": records,
+                    }
+                    prompt = load_tag_prompt(1)
+                    msgs = [{
+                        "role": "user",
+                        # без indent, чтобы не раздувать запрос
+                        "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+                    }]
+                    with st.spinner("Запрос к модели..."):
+                        resp = call_claude_api(msgs)
+                        _accumulate_cost_for_tag_run(_run_id)
+                    parsed = _extract_json_payload(resp or "")
+                    if not parsed or "items" not in parsed:
+                        st.error("Не удалось разобрать ответ модели. Попробуйте ещё раз или поменяйте модель.")
+                    else:
+                        items = parsed.get("items", [])
+                        # лёгкая валидация
+                        ok_items: List[Dict] = []
+                        expected_proto_keys = set(proto_to_norm.keys())
+                        matched_proto_keys = set()
+                        unexpected_items = 0
+                        for it in items:
+                            if not isinstance(it, dict):
+                                continue
+                            if it.get("source_table") not in ("skill_defs", "content_element_defs"):
+                                continue
+                            if "id" not in it:
+                                continue
+                            tags = it.get("tags", [])
+                            if not isinstance(tags, list) or not tags:
+                                continue
+
+                            src_table = str(it["source_table"])
+                            src_id = int(it["id"])
+                            norm = proto_to_norm.get((src_table, src_id))
+                            if not norm:
+                                # если модель вернула неожиданный id/таблицу — пропускаем
+                                unexpected_items += 1
+                                continue
+                            matched_proto_keys.add((src_table, src_id))
+
+                            cleaned_tags = [normalize_db_text(x) for x in tags if normalize_db_text(x)]
+                            if not cleaned_tags:
+                                continue
+
+                            # расширяем на ВСЕ записи с таким же frp_label (дедуп по norm)
+                            for dst_table, dst_id in norm_to_sources.get(norm, []):
+                                ok_items.append({
+                                    "source_table": dst_table,
+                                    "id": int(dst_id),
+                                    "tags": cleaned_tags,
+                                })
+
+                        if not ok_items:
+                            st.error("Ответ модели не содержит корректных items.")
+                        else:
+                            try:
+                                # Требование: сохраняем ТОЛЬКО "тема -> термины" (каждый термин отдельной строкой)
+                                topic_terms_set = set()
+                                for it in ok_items:
+                                    for tg in it.get("tags", []):
+                                        nt = normalize_db_text(tg)
+                                        if nt:
+                                            topic_terms_set.add(nt)
+                                topic_terms = sorted(topic_terms_set)
+                                _save_topic_terms(_run_id, _sel_subject_id, _cur_topic_id, topic_terms)
+                                st.session_state.tag_last_result = [{"term": t} for t in topic_terms]
+                                st.session_state.tag_last_topic_id = _cur_topic_id
+                                st.success(
+                                    f"Сохранено терминов по теме: {len(topic_terms)}. "
+                                    f"Уникальных frp_label отправлено в модель: {len(records)}."
+                                )
+                                missing = len(expected_proto_keys - matched_proto_keys)
+                                covered = len(matched_proto_keys)
+                                if missing > 0 or unexpected_items > 0:
+                                    st.warning(
+                                        f"Покрытие ответа: {covered}/{len(expected_proto_keys)} уникальных frp_label. "
+                                        f"Не покрыто: {missing}. Неожиданных items: {unexpected_items}."
+                                    )
+                            except Exception as _e:
+                                st.error(f"Ошибка сохранения в БД: {_e}")
+
+        with _act2:
+            if st.button("🧹 Очистить результаты (эта тема)", key='tag_clear_topic_btn', use_container_width=True):
+                _conn = get_db_conn()
+                if _conn is None:
+                    st.error("Нет подключения к БД.")
+                else:
+                    try:
+                        with _conn.cursor() as _cur:
+                            _cur.execute(
+                                "DELETE FROM tag_topic_terms WHERE run_id=%s AND frp_topic_id=%s",
+                                (_run_id, _cur_topic_id),
+                            )
+                        _conn.commit()
+                        _conn.close()
+                        st.session_state.tag_last_result = None
+                        st.success("Удалены термины для этой темы (только для текущего run_id).")
+                    except Exception as _e:
+                        try:
+                            _conn.close()
+                        except Exception:
+                            pass
+                        st.error(f"Ошибка очистки: {_e}")
+
+        with _act3:
+            if st.button("✨ Извлечь теги (с этой темы и до конца)", key='tag_extract_from_here_btn', use_container_width=True):
+                st.session_state.tag_stop = False
+                st.session_state.tag_batch_running = True
+                st.session_state.tag_batch_stop = False
+                st.rerun()
+            st.caption("Автопрогон обрабатывает темы по одной и сохраняет после каждой. Если тема слишком большая и ответ не влезает — позже добавим автоматическое разбиение на чанки.")
+
+        # --- Автопрогон: с текущей темы до конца (одна тема за один rerun) ---
+        if st.session_state.get('tag_batch_running'):
+            _bp = int(st.session_state.get('tag_topic_pos', 0))
+            _bt = len(_topics_df)
+
+            _pb_col, _stop_col = st.columns([6, 1])
+            with _pb_col:
+                st.progress(
+                    _bp / max(_bt, 1),
+                    text=f"Автопрогон: обрабатываю тему {min(_bp + 1, _bt)} / {_bt}… *(нажмите ⛔ чтобы остановить)*",
                 )
+            with _stop_col:
+                if st.button("⛔", key='tag_batch_stop_small', help="Остановить автопрогон", use_container_width=True):
+                    st.session_state.tag_batch_running = False
+                    st.session_state.tag_batch_stop = True
+                    st.warning("Автопрогон остановлен.")
+                    st.rerun()
+
+            # процессим текущую тему
+            if _bp < _bt:
+                _topic_row = _topics_df.iloc[_bp].to_dict()
+                _topic_id = int(_topic_row['id'])
+
+                records, norm_to_sources, proto_to_norm, total_raw = _load_topic_records_dedup(_topic_id)
+                if not records:
+                    # нет записей — пропускаем тему
+                    st.session_state.tag_topic_pos = _bp + 1
+                    if _bp + 1 >= _bt:
+                        st.session_state.tag_batch_running = False
+                    st.rerun()
+
                 payload = {
                     "subject": _sel_subj,
                     "frp_topic": {
-                        "id": _cur_topic_id,
-                        "grade_class": str(_cur_topic.get("grade_class", "")),
-                        "program": str(_cur_topic.get("program", "")),
-                        "section": str(_cur_topic.get("section", "")),
-                        "topic": str(_cur_topic.get("topic", "")),
+                        "id": _topic_id,
+                        "grade_class": str(_topic_row.get("grade_class", "")),
+                        "program": str(_topic_row.get("program", "")),
+                        "section": str(_topic_row.get("section", "")),
+                        "topic": str(_topic_row.get("topic", "")),
                     },
                     "records": records,
                 }
                 prompt = load_tag_prompt(1)
                 msgs = [{
                     "role": "user",
-                    # без indent, чтобы не раздувать запрос
                     "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
                 }]
-                with st.spinner("Запрос к модели..."):
+
+                with st.spinner(f"Автопрогон: тема {_bp + 1}/{_bt} (id={_topic_id})…"):
                     resp = call_claude_api(msgs)
                     _accumulate_cost_for_tag_run(_run_id)
+
                 parsed = _extract_json_payload(resp or "")
                 if not parsed or "items" not in parsed:
-                    st.error("Не удалось разобрать ответ модели. Попробуйте ещё раз или поменяйте модель.")
-                else:
-                    items = parsed.get("items", [])
-                    # лёгкая валидация
-                    ok_items: List[Dict] = []
-                    expected_proto_keys = set(proto_to_norm.keys())
-                    matched_proto_keys = set()
-                    unexpected_items = 0
-                    for it in items:
-                        if not isinstance(it, dict):
-                            continue
-                        if it.get("source_table") not in ("skill_defs", "content_element_defs"):
-                            continue
-                        if "id" not in it:
-                            continue
-                        tags = it.get("tags", [])
-                        if not isinstance(tags, list) or not tags:
-                            continue
-
-                        src_table = str(it["source_table"])
-                        src_id = int(it["id"])
-                        norm = proto_to_norm.get((src_table, src_id))
-                        if not norm:
-                            # если модель вернула неожиданный id/таблицу — пропускаем
-                            unexpected_items += 1
-                            continue
-                        matched_proto_keys.add((src_table, src_id))
-
-                        cleaned_tags = [normalize_db_text(x) for x in tags if normalize_db_text(x)]
-                        if not cleaned_tags:
-                            continue
-
-                        # расширяем на ВСЕ записи с таким же frp_label (дедуп по norm)
-                        for dst_table, dst_id in norm_to_sources.get(norm, []):
-                            ok_items.append({
-                                "source_table": dst_table,
-                                "id": int(dst_id),
-                                "tags": cleaned_tags,
-                            })
-
-                    if not ok_items:
-                        st.error("Ответ модели не содержит корректных items.")
-                    else:
-                        try:
-                            # Требование: сохраняем ТОЛЬКО "тема -> термины" (каждый термин отдельной строкой)
-                            topic_terms_set = set()
-                            for it in ok_items:
-                                for tg in it.get("tags", []):
-                                    nt = normalize_db_text(tg)
-                                    if nt:
-                                        topic_terms_set.add(nt)
-                            topic_terms = sorted(topic_terms_set)
-                            _save_topic_terms(_run_id, _sel_subject_id, _cur_topic_id, topic_terms)
-                            st.session_state.tag_last_result = [{"term": t} for t in topic_terms]
-                            st.session_state.tag_last_topic_id = _cur_topic_id
-                            st.success(
-                                f"Сохранено терминов по теме: {len(topic_terms)}. "
-                                f"Уникальных frp_label отправлено в модель: {len(records)}."
-                            )
-                            missing = len(expected_proto_keys - matched_proto_keys)
-                            covered = len(matched_proto_keys)
-                            if missing > 0 or unexpected_items > 0:
-                                st.warning(
-                                    f"Покрытие ответа: {covered}/{len(expected_proto_keys)} уникальных frp_label. "
-                                    f"Не покрыто: {missing}. Неожиданных items: {unexpected_items}."
-                                )
-                        except Exception as _e:
-                            st.error(f"Ошибка сохранения в БД: {_e}")
-
-    with _act2:
-        if st.button("🧹 Очистить результаты (эта тема)", key='tag_clear_topic_btn', use_container_width=True):
-            _conn = get_db_conn()
-            if _conn is None:
-                st.error("Нет подключения к БД.")
-            else:
-                try:
-                    with _conn.cursor() as _cur:
-                        _cur.execute(
-                            "DELETE FROM tag_topic_terms WHERE run_id=%s AND frp_topic_id=%s",
-                            (_run_id, _cur_topic_id),
-                        )
-                    _conn.commit()
-                    _conn.close()
+                    # на ошибке останавливаем, чтобы пользователь мог посмотреть и перезапустить
+                    st.session_state.tag_batch_running = False
                     st.session_state.tag_last_result = None
-                    st.success("Удалены термины для этой темы (только для текущего run_id).")
+                    st.session_state.tag_last_topic_id = _topic_id
+                    st.error("Автопрогон остановлен: не удалось разобрать ответ модели. Проверьте модель/промпт и повторите с этой темы.")
+                    st.stop()
+
+                items = parsed.get("items", [])
+                topic_terms_set = set()
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    tags = it.get("tags", [])
+                    if not isinstance(tags, list):
+                        continue
+                    for tg in tags:
+                        nt = normalize_db_text(tg)
+                        if nt:
+                            topic_terms_set.add(nt)
+                topic_terms = sorted(topic_terms_set)
+                try:
+                    _save_topic_terms(_run_id, _sel_subject_id, _topic_id, topic_terms)
                 except Exception as _e:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-                    st.error(f"Ошибка очистки: {_e}")
+                    st.session_state.tag_batch_running = False
+                    st.error(f"Автопрогон остановлен: ошибка сохранения в БД: {_e}")
+                    st.stop()
 
-    with _act3:
-        if st.button("✨ Извлечь теги (с этой темы и до конца)", key='tag_extract_from_here_btn', use_container_width=True):
-            st.session_state.tag_stop = False
-            st.session_state.tag_batch_running = True
-            st.session_state.tag_batch_stop = False
-            st.rerun()
-        st.caption("Автопрогон обрабатывает темы по одной и сохраняет после каждой. Если тема слишком большая и ответ не влезает — позже добавим автоматическое разбиение на чанки.")
-
-    # --- Автопрогон: с текущей темы до конца (одна тема за один rerun) ---
-    if st.session_state.get('tag_batch_running'):
-        _bp = int(st.session_state.get('tag_topic_pos', 0))
-        _bt = len(_topics_df)
-
-        _pb_col, _stop_col = st.columns([6, 1])
-        with _pb_col:
-            st.progress(
-                _bp / max(_bt, 1),
-                text=f"Автопрогон: обрабатываю тему {min(_bp + 1, _bt)} / {_bt}… *(нажмите ⛔ чтобы остановить)*",
-            )
-        with _stop_col:
-            if st.button("⛔", key='tag_batch_stop_small', help="Остановить автопрогон", use_container_width=True):
-                st.session_state.tag_batch_running = False
-                st.session_state.tag_batch_stop = True
-                st.warning("Автопрогон остановлен.")
-                st.rerun()
-
-        # процессим текущую тему
-        if _bp < _bt:
-            _topic_row = _topics_df.iloc[_bp].to_dict()
-            _topic_id = int(_topic_row['id'])
-
-            records, norm_to_sources, proto_to_norm, total_raw = _load_topic_records_dedup(_topic_id)
-            if not records:
-                # нет записей — пропускаем тему
+                # следующий шаг
                 st.session_state.tag_topic_pos = _bp + 1
+                st.session_state.tag_last_result = [{"term": t} for t in topic_terms]
+                st.session_state.tag_last_topic_id = _topic_id
                 if _bp + 1 >= _bt:
                     st.session_state.tag_batch_running = False
+                    st.success("Автопрогон завершён.")
                 st.rerun()
 
-            payload = {
-                "subject": _sel_subj,
-                "frp_topic": {
-                    "id": _topic_id,
-                    "grade_class": str(_topic_row.get("grade_class", "")),
-                    "program": str(_topic_row.get("program", "")),
-                    "section": str(_topic_row.get("section", "")),
-                    "topic": str(_topic_row.get("topic", "")),
-                },
-                "records": records,
-            }
-            prompt = load_tag_prompt(1)
-            msgs = [{
-                "role": "user",
-                "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
-            }]
-
-            with st.spinner(f"Автопрогон: тема {_bp + 1}/{_bt} (id={_topic_id})…"):
-                resp = call_claude_api(msgs)
-                _accumulate_cost_for_tag_run(_run_id)
-
-            parsed = _extract_json_payload(resp or "")
-            if not parsed or "items" not in parsed:
-                # на ошибке останавливаем, чтобы пользователь мог посмотреть и перезапустить
-                st.session_state.tag_batch_running = False
-                st.session_state.tag_last_result = None
-                st.session_state.tag_last_topic_id = _topic_id
-                st.error("Автопрогон остановлен: не удалось разобрать ответ модели. Проверьте модель/промпт и повторите с этой темы.")
-                st.stop()
-
-            items = parsed.get("items", [])
-            topic_terms_set = set()
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                tags = it.get("tags", [])
-                if not isinstance(tags, list):
-                    continue
-                for tg in tags:
-                    nt = normalize_db_text(tg)
-                    if nt:
-                        topic_terms_set.add(nt)
-            topic_terms = sorted(topic_terms_set)
-            try:
-                _save_topic_terms(_run_id, _sel_subject_id, _topic_id, topic_terms)
-            except Exception as _e:
-                st.session_state.tag_batch_running = False
-                st.error(f"Автопрогон остановлен: ошибка сохранения в БД: {_e}")
-                st.stop()
-
-            # следующий шаг
-            st.session_state.tag_topic_pos = _bp + 1
-            st.session_state.tag_last_result = [{"term": t} for t in topic_terms]
-            st.session_state.tag_last_topic_id = _topic_id
-            if _bp + 1 >= _bt:
-                st.session_state.tag_batch_running = False
-                st.success("Автопрогон завершён.")
+            st.session_state.tag_batch_running = False
             st.rerun()
 
-        st.session_state.tag_batch_running = False
-        st.rerun()
-
-    if st.session_state.get('tag_last_result') and st.session_state.get('tag_last_topic_id') == _cur_topic_id:
-        st.markdown("**Последний результат (эта тема):**")
-        st.dataframe(pd.DataFrame(st.session_state.tag_last_result), use_container_width=True, hide_index=True)
+        if st.session_state.get('tag_last_result') and st.session_state.get('tag_last_topic_id') == _cur_topic_id:
+            st.markdown("**Последний результат (эта тема):**")
+            st.dataframe(pd.DataFrame(st.session_state.tag_last_result), use_container_width=True, hide_index=True)
 
     # ===================== НОРМАЛИЗАЦИЯ (внизу страницы) =====================
     st.markdown("---")
     st.header("🧠 Нормализация словаря (синонимы → канонические теги)")
 
-    if not _ok2:
-        st.info("Примените миграцию `db/migrations/006_tag_normalization.sql` в Neon SQL Editor, чтобы включить нормализацию и иерархизацию.")
-        st.stop()
+    _norm_schema_ok = bool(_ok2)
+    if not _norm_schema_ok:
+        st.warning("Примените миграцию `db/migrations/006_tag_normalization.sql` в Neon SQL Editor, чтобы включить нормализацию и иерархизацию (кнопки ниже неактивны).")
 
     st.caption(
         "Выберите один или несколько предметов: для каждого берутся он и все потомки в subjects; "
@@ -5098,11 +5127,13 @@ elif mode == 'tagging_init':
 
     _canonical_subject_id = int(_subj_name_to_id.get(_canonical_name))
 
-    def _get_unique_terms_for_subtree(extraction_run_id: int, subject_ids: List[int]) -> List[Tuple[str, List[int]]]:
+    def _get_unique_terms_for_subtree(extraction_run_id: Optional[int], subject_ids: List[int]) -> List[Tuple[str, List[int]]]:
         """
         Возвращает список (term, [subject_id...]) уникальных term_norm в выбранном дереве предметов,
         только из строк tag_topic_terms, которые ещё не помечены processed_at.
         """
+        if extraction_run_id is None:
+            return []
         if not subject_ids:
             return []
         conn = get_db_conn()
@@ -5407,7 +5438,12 @@ elif mode == 'tagging_init':
     _a1, _a2, _a3, _a4 = st.columns([3, 3, 3, 3])
 
     with _a1:
-        _start_norm = st.button("🚀 Запустить синонимизацию", key='tag_syn_start_btn', use_container_width=True, disabled=(len(_unique_terms) == 0))
+        _start_norm = st.button(
+            "🚀 Запустить синонимизацию",
+            key='tag_syn_start_btn',
+            use_container_width=True,
+            disabled=(len(_unique_terms) == 0) or (not _norm_schema_ok) or (_run_id is None),
+        )
     with _a2:
         _resume_norm = st.button("▶️ Продолжить", key='tag_syn_resume_btn', use_container_width=True)
     with _a3:
@@ -5597,7 +5633,12 @@ elif mode == 'tagging_init':
 
     _h1, _h2 = st.columns([3, 9])
     with _h1:
-        _run_h = st.button("🧩 Построить иерархию", key='tag_hierarchy_run_btn', use_container_width=True, disabled=(len(_tags_for_h) == 0))
+        _run_h = st.button(
+            "🧩 Построить иерархию",
+            key='tag_hierarchy_run_btn',
+            use_container_width=True,
+            disabled=(len(_tags_for_h) == 0) or (not _norm_schema_ok),
+        )
     with _h2:
         st.caption("После построения можно показать дерево как список с отступами.")
 
