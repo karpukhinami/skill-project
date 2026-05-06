@@ -5063,24 +5063,48 @@ elif mode == 'tagging_init':
         st.info("Примените миграцию `db/migrations/006_tag_normalization.sql` в Neon SQL Editor, чтобы включить нормализацию и иерархизацию.")
         st.stop()
 
-    st.caption("Нормализация работает по выбранному предмету и всем его детям: берём уникальные термины из stейджинга, чанкуем по 500, затем делаем merge-pass по каноническим.")
+    st.caption(
+        "Выберите один или несколько предметов: для каждого берутся он и все потомки в subjects; "
+        "термины из tag_topic_terms объединяются. Канонический словарь (tags / tag_aliases) пишется в выбранный ниже предмет."
+    )
 
-    _ncol1, _ncol2, _ncol3 = st.columns([3, 3, 6])
+    _ncol1, _ncol2, _ncol3 = st.columns([4, 2, 6])
     with _ncol1:
-        _root_subject_name = st.selectbox("Корневой предмет для нормализации", _subj_names, index=_subj_names.index(_sel_subj), key='tag_norm_root_subject_name')
+        _norm_default = [_sel_subj] if _sel_subj in _subj_names else (_subj_names[:1] if _subj_names else [])
+        _norm_root_names = st.multiselect(
+            "Предметы: источник терминов (каждый + дети)",
+            options=_subj_names,
+            default=_norm_default,
+            key='tag_norm_root_subject_names',
+        )
     with _ncol2:
         _chunk_size = st.number_input("Chunk size", min_value=100, max_value=1500, value=500, step=50, key='tag_norm_chunk_size')
     with _ncol3:
-        st.caption("При выборе «математика» будут обработаны термины из алгебры/геометрии/вероятности и т.д. Сохраняем, в каких предметах встречалось (через tag_subjects).")
+        _canon_idx = _subj_names.index("математика") if "математика" in _subj_names else 0
+        _canonical_name = st.selectbox(
+            "Канонический предмет (куда писать tags и алиасы)",
+            _subj_names,
+            index=_canon_idx,
+            key='tag_norm_canonical_subject_name',
+        )
+        st.caption("Иерархия тегов и merge-pass тоже используют этот предмет. tag_subjects фиксирует реальные subject_id из стейджинга.")
 
-    _root_subject_id = int(_subj_name_to_id.get(_root_subject_name))
-    _subtree_ids = _subject_subtree_ids(_root_subject_id)
+    if not _norm_root_names:
+        st.warning("Выберите хотя бы один предмет для сбора терминов из стейджинга.")
+        _staging_union_ids: List[int] = []
+    else:
+        _picked_ids = [int(_subj_name_to_id[n]) for n in _norm_root_names if n in _subj_name_to_id]
+        _staging_union_ids = sorted({sid for rid in _picked_ids for sid in _subject_subtree_ids(rid)})
+
+    _canonical_subject_id = int(_subj_name_to_id.get(_canonical_name))
 
     def _get_unique_terms_for_subtree(extraction_run_id: int, subject_ids: List[int]) -> List[Tuple[str, List[int]]]:
         """
         Возвращает список (term, [subject_id...]) уникальных term_norm в выбранном дереве предметов,
         только из строк tag_topic_terms, которые ещё не помечены processed_at.
         """
+        if not subject_ids:
+            return []
         conn = get_db_conn()
         if conn is None:
             return []
@@ -5112,7 +5136,7 @@ elif mode == 'tagging_init':
                 pass
             return []
 
-    _unique_terms = _get_unique_terms_for_subtree(_run_id, _subtree_ids)
+    _unique_terms = _get_unique_terms_for_subtree(_run_id, _staging_union_ids)
     st.metric("Уникальных терминов к обработке", len(_unique_terms))
 
     st.caption("Если число слишком большое для одного запроса — это нормально: будет чанкование. Прогресс по чанкам сохраняется в БД.")
@@ -5214,13 +5238,18 @@ elif mode == 'tagging_init':
             except Exception:
                 pass
 
-    def _apply_synonyms(root_subject_id: int, syn_run_id: int, groups: List[Dict]) -> Tuple[int, int]:
+    def _apply_synonyms(
+        root_subject_id: int,
+        syn_run_id: int,
+        groups: List[Dict],
+        staging_subject_ids: List[int],
+    ) -> Tuple[int, int]:
         """
         Применяет canonical/aliases:
-        - создаёт/находит tags (subject_id = root_subject_id)
+        - создаёт/находит tags (subject_id = root_subject_id — канонический предмет)
         - создаёт tag_aliases (subject_id = root_subject_id)
         - проставляет tag_subjects по union предметов, где встречались термины
-        - помечает tag_topic_terms.processed_at/processsed_run_id для всех термов в группе в выбранном поддереве
+        - помечает tag_topic_terms.processed_at/processed_run_id для термов группы в staging_subject_ids
 
         Возвращает (created_tags_cnt, created_aliases_cnt)
         """
@@ -5288,7 +5317,7 @@ elif mode == 'tagging_init':
                         (int(tag_id), int(sid)),
                     )
 
-                # помечаем обработанными все вхождения этих термов в стейджинге (по поддереву)
+                # помечаем обработанными все вхождения этих термов в стейджинге (по объединённым предметам)
                 for term in [canon] + aliases:
                     cur.execute(
                         """
@@ -5299,7 +5328,7 @@ elif mode == 'tagging_init':
                           AND subject_id = ANY(%s)
                           AND term_norm = normalize_term(%s)
                         """,
-                        (int(syn_run_id), int(_run_id), _subtree_ids, term),
+                        (int(syn_run_id), int(_run_id), staging_subject_ids, term),
                     )
 
         conn.commit()
@@ -5399,7 +5428,7 @@ elif mode == 'tagging_init':
 
     if _start_norm:
         # создаём syn_run и чанки
-        syn_run_id = _ensure_syn_run(_run_id, _root_subject_id, int(_chunk_size))
+        syn_run_id = _ensure_syn_run(_run_id, _canonical_subject_id, int(_chunk_size))
         st.session_state.tag_syn_run_id = syn_run_id
         st.session_state.tag_syn_phase = 'chunk'
         st.session_state.tag_syn_running = True
@@ -5449,7 +5478,7 @@ elif mode == 'tagging_init':
                     with conn.cursor() as cur:
                         cur.execute(
                             "SELECT tag FROM tags WHERE subject_id=%s AND is_archived=FALSE ORDER BY tag",
-                            (int(_root_subject_id),),
+                            (int(_canonical_subject_id),),
                         )
                         canon_tags = [str(r[0]) for r in cur.fetchall()]
                     conn.close()
@@ -5490,7 +5519,11 @@ elif mode == 'tagging_init':
             terms = input_terms if isinstance(input_terms, list) else (input_terms or [])
 
             st.progress(0.5, text=f"Синонимизация: phase={_phase}, chunk {chunk_idx}…")
-            payload = {"subject": _root_subject_name, "terms": terms}
+            payload = {
+                "subject": _canonical_name,
+                "source_subjects": _norm_root_names,
+                "terms": terms,
+            }
             prompt = load_tag_prompt(2)
             msgs = [{"role": "user", "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"}]
             try:
@@ -5504,9 +5537,9 @@ elif mode == 'tagging_init':
                     raise RuntimeError("Пустой canonical")
 
                 if _phase == 'chunk':
-                    created_tags, created_aliases = _apply_synonyms(_root_subject_id, _syn_id, groups)
+                    created_tags, created_aliases = _apply_synonyms(_canonical_subject_id, _syn_id, groups, _staging_union_ids)
                 else:
-                    archived = _merge_canonicals(_root_subject_id, groups)
+                    archived = _merge_canonicals(_canonical_subject_id, groups)
                     created_tags, created_aliases = 0, 0
 
                 # записываем результат чанка
@@ -5540,7 +5573,7 @@ elif mode == 'tagging_init':
     # ===================== ИЕРАРХИЗАЦИЯ (внизу) =====================
     st.markdown("---")
     st.header("🧩 Иерархия тегов (child → parent)")
-    st.caption("Запускается отдельно после синонимизации. Используются только активные канонические tags корневого предмета.")
+    st.caption("Запускается отдельно после синонимизации. Используются только активные канонические tags выбранного канонического предмета.")
 
     def _load_active_tags(root_subject_id: int) -> List[str]:
         conn = get_db_conn()
@@ -5559,7 +5592,7 @@ elif mode == 'tagging_init':
                 pass
             return []
 
-    _tags_for_h = _load_active_tags(_root_subject_id)
+    _tags_for_h = _load_active_tags(_canonical_subject_id)
     st.metric("Канонических тегов", len(_tags_for_h))
 
     _h1, _h2 = st.columns([3, 9])
@@ -5627,7 +5660,7 @@ elif mode == 'tagging_init':
         return lines
 
     if _run_h:
-        payload = {"subject": _root_subject_name, "tags": _tags_for_h}
+        payload = {"subject": _canonical_name, "tags": _tags_for_h}
         prompt = load_tag_hierarchy_prompt()
         msgs = [{"role": "user", "content": f"{prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"}]
         with st.spinner("Запрос к модели (иерархия)..."):
@@ -5639,9 +5672,9 @@ elif mode == 'tagging_init':
         else:
             edges = parsed.get("hierarchy") or []
             try:
-                _apply_hierarchy(_root_subject_id, edges)
+                _apply_hierarchy(_canonical_subject_id, edges)
                 st.success(f"Иерархия применена: {len(edges)} связей.")
-                st.session_state['tag_hierarchy_last'] = _build_indented_list(_root_subject_id)
+                st.session_state['tag_hierarchy_last'] = _build_indented_list(_canonical_subject_id)
             except Exception as e:
                 st.error(f"Не удалось применить иерархию: {e}")
 

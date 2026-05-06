@@ -167,17 +167,20 @@ normalize_term(x):
 
 
 Шаг 2. Нормализация и иерархия
-- Берём уникальный список term_norm по выбранному корневому предмету и его детям:
-  SELECT DISTINCT term_norm FROM tag_topic_terms WHERE subject_id IN subtree AND processed_at IS NULL.
+- В UI выбирается один или несколько «источников» предметов: для каждого берётся он и всё поддерево в subjects.
+  Объединение этих subject_id задаёт область tag_topic_terms (ещё с processed_at IS NULL).
+- Отдельно выбирается канонический предмет: в его subject_id пишутся tags и tag_aliases (единый словарь).
+- Берём уникальный список term_norm по объединённым subject_id:
+  SELECT … FROM tag_topic_terms WHERE subject_id = ANY(union_ids) AND processed_at IS NULL.
 
 2A) Синонимизация (чанки)
 - Делаем чанкование (по умолчанию 500 терминов).
 - На каждом чанке модель возвращает canonical-группы: {tag, aliases}.
 - Прогресс пишется в БД (tag_syn_runs + tag_syn_chunks), чтобы можно было продолжить после сбоя.
-- Создаём/обновляем канонические tags в subject_id корневого предмета.
-- Создаём алиасы в tag_aliases (subject_id корневого предмета).
-- Сохраняем, в каких предметах поддерева термин встречался: tag_subjects(tag_id, subject_id).
-- Помечаем обработанные термины в tag_topic_terms.processed_at / processed_run_id.
+- Создаём/обновляем канонические tags в subject_id канонического предмета.
+- Создаём алиасы в tag_aliases (тот же subject_id).
+- Сохраняем, в каких предметах термин встречался: tag_subjects(tag_id, subject_id) — реальные subject_id из стейджинга.
+- Помечаем обработанные термины в tag_topic_terms.processed_at / processed_run_id (только строки в объединённой области предметов).
 
 2B) Merge-pass
 - Берём получившийся список канонических tags и повторяем синонимизацию ещё раз (тоже чанками).
@@ -188,7 +191,7 @@ normalize_term(x):
   - добавляем alias на победителя.
 
 2C) Иерархизация (отдельный запрос)
-- Модель получает только список канонических tags корневого предмета.
+- Модель получает только список канонических tags выбранного канонического предмета.
 - Возвращает пары child→parent.
 - Проставляем tags.parent_id.
 - В UI показываем дерево как список с отступами (до 3 уровней).
