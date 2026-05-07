@@ -721,17 +721,29 @@ def load_tag_hierarchy_prompt() -> str:
         return ""
 
 
+def _strip_thinking_blocks(s: str) -> str:
+    """Убирает типичные обёртки «рассуждений» модели до/вокруг JSON."""
+    t = str(s)
+    # <think>...</think> (разные варианты написания)
+    t = re.sub(r"<think>[\s\S]*?</think>", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"<thinking>[\s\S]*?</thinking>", "", t, flags=re.IGNORECASE)
+    return t.strip()
+
+
 def _extract_json_payload(text: str) -> Optional[Dict]:
     """
-    Извлекает JSON из ответа модели и отрезает лишний текст.
+    Извлекает JSON-объект из ответа модели и отрезает лишний текст до/после.
     Умеет:
     - снимать ```json fences
-    - доставать самый большой {...} или [...] блок
-    - пытаться дописать закрывающие скобки/кавычки (как в parse_llm_response)
+    - отрезать преамбулу до первого «{»
+    - парсить через JSONDecoder.raw_decode (игнорирует хвост после закрывающей «}»)
+    - перебирать несколько стартовых «{», если первый — ложный
+    - запасной путь: самый большой {...} блок и доп. закрывающие скобки
     """
     if not text:
         return None
-    t = str(text).strip()
+    t = _strip_thinking_blocks(str(text).strip())
+    t = t.replace("\ufeff", "").strip()
 
     # markdown fences
     if "```" in t:
@@ -770,7 +782,40 @@ def _extract_json_payload(text: str) -> Optional[Dict]:
                     pass
         return None
 
-    # предпочитаем объект {...} (по нашему контракту), но если его нет — пробуем массив
+    def _try_raw_decode_dict(s: str) -> Optional[Dict]:
+        """Ищет первый валидный JSON-объект с позиции каждого «{»."""
+        dec = json.JSONDecoder()
+        s = s.strip()
+        starts: List[int] = []
+        p = 0
+        while len(starts) < 40:
+            j = s.find("{", p)
+            if j == -1:
+                break
+            starts.append(j)
+            p = j + 1
+        for j in starts:
+            try:
+                obj, _end = dec.raw_decode(s, j)
+                if isinstance(obj, dict):
+                    return obj
+            except (json.JSONDecodeError, ValueError):
+                continue
+        return None
+
+    # 1) raw_decode: устойчиво к тексту после закрывающей скобки JSON
+    _d = _try_raw_decode_dict(t)
+    if isinstance(_d, dict):
+        return _d
+
+    # 2) отрезать явную преамбулу и повторить
+    if "{" in t:
+        t2 = t[t.find("{") :]
+        _d = _try_raw_decode_dict(t2)
+        if isinstance(_d, dict):
+            return _d
+
+    # 3) запасной путь по кандидатам-регуляркам
     obj_matches = re.findall(r"\{[\s\S]*\}", t)
     arr_matches = re.findall(r"\[[\s\S]*\]", t)
 
@@ -783,13 +828,76 @@ def _extract_json_payload(text: str) -> Optional[Dict]:
         parsed = _try_parse(t)
         return parsed if isinstance(parsed, dict) else None
 
-    # берём самый большой блок (обычно это “правильный” JSON)
     candidates.sort(key=len, reverse=True)
-    for cand in candidates[:3]:
+    for cand in candidates[:5]:
         parsed = _try_parse(cand)
         if isinstance(parsed, dict):
             return parsed
+        _d = _try_raw_decode_dict(cand)
+        if isinstance(_d, dict):
+            return _d
     return None
+
+
+def _validate_and_sanitize_tag_assign_results(
+    raw_results: List,
+    source_table: str,
+    expected_ids: List[int],
+) -> Tuple[Optional[List[Dict]], List[str]]:
+    """
+    Проверяет ответ назначения тегов по контракту промпта 3.
+    Возвращает (очищенный список results или None, список предупреждений).
+    """
+    warns: List[str] = []
+    if not isinstance(raw_results, list):
+        return None, ["Поле results не является массивом."]
+    if len(raw_results) != len(expected_ids):
+        return None, [f"Число элементов results ({len(raw_results)}) ≠ числу записей ({len(expected_ids)})."]
+
+    out: List[Dict] = []
+    for idx, exp_id in enumerate(expected_ids):
+        item = raw_results[idx] if idx < len(raw_results) else None
+        if not isinstance(item, dict):
+            return None, [f"Позиция {idx}: элемент не объект."]
+        rid = item.get("id")
+        try:
+            rid_int = int(rid)
+        except (TypeError, ValueError):
+            return None, [f"Позиция {idx}: невалидный id."]
+        if rid_int != int(exp_id):
+            return None, [f"Позиция {idx}: ожидался id={exp_id}, в ответе id={rid_int}."]
+
+        stbl = item.get("source_table")
+        if stbl is not None and str(stbl) != str(source_table):
+            warns.append(f"id={rid_int}: поле source_table «{stbl}» заменено на «{source_table}».")
+
+        tags = item.get("tags")
+        if tags is None:
+            tags = []
+        if not isinstance(tags, list):
+            return None, [f"id={rid_int}: tags должен быть массивом."]
+        tags = [str(x) for x in tags if isinstance(x, (str, int, float)) and str(x).strip()]
+
+        nt = item.get("new_tags")
+        if nt is None:
+            nt = []
+        if not isinstance(nt, list):
+            return None, [f"id={rid_int}: new_tags должен быть массивом."]
+        nt = [str(x) for x in nt if isinstance(x, (str, int, float)) and str(x).strip()]
+
+        extra = set(item.keys()) - {"source_table", "id", "tags", "new_tags"}
+        if extra:
+            warns.append(f"id={rid_int}: убраны лишние поля: {', '.join(sorted(extra))[:200]}")
+
+        out.append(
+            {
+                "source_table": str(source_table),
+                "id": rid_int,
+                "tags": tags,
+                "new_tags": nt,
+            }
+        )
+    return out, warns
 
 
 st.set_page_config(page_title="Извлечение ФРП", layout="wide")
@@ -6373,38 +6481,30 @@ elif mode == 'tagging_assign':
         with st.spinner("Запрос к модели…"):
             _resp = call_claude_api(_msgs)
         _parsed = _extract_json_payload(_resp or "")
-        _raw_res = _parsed.get("results") if isinstance(_parsed, dict) else None
-        if not isinstance(_raw_res, list):
-            st.error("Не удалось разобрать ответ модели (ожидается JSON с массивом results).")
-        elif len(_raw_res) != len(_defs_df):
+        if not isinstance(_parsed, dict):
             st.error(
-                f"Число результатов ({len(_raw_res)}) не совпадает с числом записей ({len(_defs_df)}). "
-                "Повторите запрос."
+                "Не удалось извлечь JSON из ответа модели (проверьте, что в ответе есть один объект `{...}`)."
             )
         else:
-            _by_id: Dict[int, Dict] = {}
-            for _r in _raw_res:
-                if not isinstance(_r, dict) or _r.get("id") is None:
-                    continue
-                try:
-                    _by_id[int(_r["id"])] = _r
-                except (TypeError, ValueError):
-                    pass
+            _raw_res = _parsed.get("results")
             _expected_ids = [int(x) for x in _defs_df["id"].tolist()]
-            _bad = [i for i in _expected_ids if i not in _by_id]
-            if _bad:
-                st.error(f"В ответе нет результатов для id: {_bad[:30]}{'…' if len(_bad) > 30 else ''}")
+            _ordered, _val_warns = _validate_and_sanitize_tag_assign_results(
+                _raw_res if isinstance(_raw_res, list) else None,
+                _kind,
+                _expected_ids,
+            )
+            for _vw in _val_warns:
+                if _vw:
+                    st.caption(_vw)
+            if _ordered is None:
+                st.error(
+                    "Ответ модели не прошёл проверку. См. сообщения выше. "
+                    "При необходимости повторите запрос — лишний текст до/после JSON теперь отрезается автоматически."
+                )
             else:
-                _ordered: List[Dict] = []
                 _pre_rows: List[Dict] = []
-                for _, _drow in _defs_df.iterrows():
+                for (_, _drow), _rrow in zip(_defs_df.iterrows(), _ordered):
                     _rid = int(_drow["id"])
-                    _rrow = dict(_by_id[_rid])
-                    if "new_tags" not in _rrow or not isinstance(_rrow.get("new_tags"), list):
-                        _rrow["new_tags"] = []
-                    if "tags" not in _rrow or not isinstance(_rrow.get("tags"), list):
-                        _rrow["tags"] = []
-                    _ordered.append(_rrow)
                     _nt = _rrow.get("new_tags") or []
                     _pre_rows.append(
                         {
@@ -6425,7 +6525,7 @@ elif mode == 'tagging_assign':
                     "preview_rows": _pre_rows,
                     "record_ids": _expected_ids,
                 }
-                st.success("Ответ модели принят. Проверьте таблицу ниже и нажмите OK для записи в БД.")
+                st.success("Ответ модели принят и проверен. Проверьте таблицу ниже и нажмите OK для записи в БД.")
                 st.rerun()
 
     _prev = st.session_state.get("tag_assign_preview")
