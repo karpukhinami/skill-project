@@ -187,6 +187,77 @@ def load_tag_hierarchy_prompt() -> str:
         return ""
 
 
+def _extract_json_payload(text: str) -> Optional[Dict]:
+    """
+    Извлекает JSON из ответа модели и отрезает лишний текст.
+    Умеет:
+    - снимать ```json fences
+    - доставать самый большой {...} или [...] блок
+    - пытаться дописать закрывающие скобки/кавычки (как в parse_llm_response)
+    """
+    if not text:
+        return None
+    t = str(text).strip()
+
+    # markdown fences
+    if "```" in t:
+        parts = t.split("```")
+        if len(parts) >= 3:
+            inner = parts[1]
+            lines = inner.split("\n")
+            if lines and lines[0].strip().lower() in ("json", "javascript", ""):
+                inner = "\n".join(lines[1:])
+            t = inner.strip()
+        else:
+            t = max(parts, key=len).strip()
+
+    def _try_parse(s: str):
+        s = s.strip()
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+        for closing in ("]", "]}", "}]",
+                        "}", "}}",
+                        "\"]", "\"}", "\"}]"):
+            try:
+                return json.loads(s + closing)
+            except Exception:
+                pass
+        last_brace = s.rfind("},")
+        if last_brace == -1:
+            last_brace = s.rfind("}")
+        if last_brace > 0:
+            candidate = s[: last_brace + 1]
+            for wrap in ("", "]", "}"):
+                try:
+                    return json.loads(candidate + wrap)
+                except Exception:
+                    pass
+        return None
+
+    # предпочитаем объект {...} (по нашему контракту), но если его нет — пробуем массив
+    obj_matches = re.findall(r"\{[\s\S]*\}", t)
+    arr_matches = re.findall(r"\[[\s\S]*\]", t)
+
+    candidates = []
+    if obj_matches:
+        candidates.extend(obj_matches)
+    if arr_matches:
+        candidates.extend(arr_matches)
+    if not candidates:
+        parsed = _try_parse(t)
+        return parsed if isinstance(parsed, dict) else None
+
+    # берём самый большой блок (обычно это “правильный” JSON)
+    candidates.sort(key=len, reverse=True)
+    for cand in candidates[:3]:
+        parsed = _try_parse(cand)
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 st.set_page_config(page_title="Извлечение ФРП", layout="wide")
 
 # --- Вспомогательные функции для JSON ---
@@ -4668,76 +4739,6 @@ elif mode == 'tagging_init':
                 st.session_state.tag_batch_running = False
                 st.session_state.tag_batch_stop = True
                 st.warning("Остановлено. Вы можете продолжить позже, нажмите «Извлечь теги» на нужной теме.")
-
-        def _extract_json_payload(text: str) -> Optional[Dict]:
-            """
-            Извлекает JSON из ответа модели и отрезает лишний текст.
-            Умеет:
-            - снимать ```json fences
-            - доставать самый большой {...} или [...] блок
-            - пытаться дописать закрывающие скобки/кавычки (как в parse_llm_response)
-            """
-            if not text:
-                return None
-            t = str(text).strip()
-
-            # markdown fences
-            if "```" in t:
-                parts = t.split("```")
-                if len(parts) >= 3:
-                    inner = parts[1]
-                    lines = inner.split("\n")
-                    if lines and lines[0].strip().lower() in ("json", "javascript", ""):
-                        inner = "\n".join(lines[1:])
-                    t = inner.strip()
-                else:
-                    t = max(parts, key=len).strip()
-
-            def _try_parse(s: str):
-                s = s.strip()
-                try:
-                    return json.loads(s)
-                except Exception:
-                    pass
-                for closing in ("]", "]}", "}]",
-                                "}", "}}",
-                                "\"]", "\"}", "\"}]"):
-                    try:
-                        return json.loads(s + closing)
-                    except Exception:
-                        pass
-                last_brace = s.rfind("},")
-                if last_brace == -1:
-                    last_brace = s.rfind("}")
-                if last_brace > 0:
-                    candidate = s[: last_brace + 1]
-                    for wrap in ("", "]", "}"):
-                        try:
-                            return json.loads(candidate + wrap)
-                        except Exception:
-                            pass
-                return None
-
-            # предпочитаем объект {...} (по нашему контракту), но если его нет — пробуем массив
-            obj_matches = re.findall(r"\{[\s\S]*\}", t)
-            arr_matches = re.findall(r"\[[\s\S]*\]", t)
-
-            candidates = []
-            if obj_matches:
-                candidates.extend(obj_matches)
-            if arr_matches:
-                candidates.extend(arr_matches)
-            if not candidates:
-                parsed = _try_parse(t)
-                return parsed if isinstance(parsed, dict) else None
-
-            # берём самый большой блок (обычно это “правильный” JSON)
-            candidates.sort(key=len, reverse=True)
-            for cand in candidates[:3]:
-                parsed = _try_parse(cand)
-                if isinstance(parsed, dict):
-                    return parsed
-            return None
 
         def _load_topic_records_dedup(topic_id: int) -> Tuple[List[Dict], Dict[str, List[Tuple[str, int]]], Dict[Tuple[str, int], str], int]:
             """
