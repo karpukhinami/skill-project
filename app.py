@@ -405,6 +405,213 @@ def promote_tag_aliases_to_canonical(alias_ids: List[int]) -> Tuple[int, List[st
     return ok, msgs
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_tag_dictionary_for_assign(link_subject_id: int) -> List[str]:
+    """
+    Канонические строки тегов для предмета link_subject_id:
+    через tag_subjects, если таблица есть; иначе только tags.subject_id.
+    """
+    conn = get_db_conn()
+    if conn is None:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = 'public' AND table_name = 'tag_subjects'
+                )
+                """
+            )
+            has_ts = bool(cur.fetchone()[0])
+            if has_ts:
+                cur.execute(
+                    """
+                    SELECT DISTINCT t.tag
+                    FROM tags t
+                    INNER JOIN tag_subjects ts ON ts.tag_id = t.id
+                    WHERE ts.subject_id = %s AND t.is_archived = FALSE
+                    ORDER BY t.tag
+                    """,
+                    (int(link_subject_id),),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT DISTINCT t.tag
+                    FROM tags t
+                    WHERE t.subject_id = %s AND t.is_archived = FALSE
+                    ORDER BY t.tag
+                    """,
+                    (int(link_subject_id),),
+                )
+            rows = cur.fetchall()
+        conn.close()
+        return [str(r[0]) for r in rows if r and r[0] is not None]
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return []
+
+
+def load_defs_rows_for_topic_assign(frp_topic_id: int, source_table: str) -> pd.DataFrame:
+    """Строки skill_defs / content_element_defs по теме (непустой label_normalized)."""
+    if source_table not in ('skill_defs', 'content_element_defs'):
+        return pd.DataFrame()
+    conn = get_db_conn()
+    if conn is None:
+        return pd.DataFrame()
+    try:
+        df = pd.read_sql(
+            f"""
+            SELECT id, label_normalized, frp_label
+            FROM {source_table}
+            WHERE frp_topic_id = %s
+              AND label_normalized IS NOT NULL
+              AND btrim(label_normalized::text) <> ''
+            ORDER BY id
+            """,
+            conn,
+            params=(int(frp_topic_id),),
+        )
+        conn.close()
+        return df
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+
+def apply_assigned_tags_from_llm(
+    link_subject_id: int,
+    source_table: str,
+    results: List[Dict],
+    tag_dictionary: List[str],
+) -> Tuple[int, List[str]]:
+    """
+    Записывает skill_tags или content_tags: сначала снимает старые связи у переданных id,
+    затем вставляет пары по ответу модели (только теги из словаря).
+    """
+    warns: List[str] = []
+    if source_table not in ('skill_defs', 'content_element_defs'):
+        return 0, ['Неверная source_table']
+    conn = get_db_conn()
+    if conn is None:
+        return 0, ['Нет подключения к БД']
+    dict_set = {normalize_db_text(x) for x in tag_dictionary if normalize_db_text(str(x))}
+    ins_cnt = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = 'public' AND table_name = 'tag_subjects'
+                )
+                """
+            )
+            has_ts = bool(cur.fetchone()[0])
+
+            ids: List[int] = []
+            for r in results:
+                if not isinstance(r, dict) or r.get('id') is None:
+                    continue
+                try:
+                    ids.append(int(r['id']))
+                except (TypeError, ValueError):
+                    continue
+            if not ids:
+                conn.close()
+                return 0, ['Нет корректных id в results']
+
+            if source_table == 'skill_defs':
+                cur.execute("DELETE FROM skill_tags WHERE skill_id = ANY(%s)", (ids,))
+            else:
+                cur.execute("DELETE FROM content_tags WHERE content_id = ANY(%s)", (ids,))
+
+            for r in results:
+                if not isinstance(r, dict) or r.get('id') is None:
+                    continue
+                try:
+                    rid = int(r['id'])
+                except (TypeError, ValueError):
+                    continue
+                tags = r.get('tags') or []
+                if not isinstance(tags, list):
+                    continue
+                for tag_str in tags:
+                    if not isinstance(tag_str, str):
+                        continue
+                    tn = normalize_db_text(tag_str)
+                    if not tn or tn not in dict_set:
+                        warns.append(f"id={rid}: «{tag_str}» не из словаря — пропуск")
+                        continue
+                    if has_ts:
+                        cur.execute(
+                            """
+                            SELECT t.id
+                            FROM tags t
+                            INNER JOIN tag_subjects ts ON ts.tag_id = t.id
+                            WHERE ts.subject_id = %s
+                              AND t.tag = normalize_term(%s)
+                              AND t.is_archived = FALSE
+                            LIMIT 1
+                            """,
+                            (int(link_subject_id), tag_str),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT id FROM tags
+                            WHERE subject_id = %s
+                              AND tag = normalize_term(%s)
+                              AND is_archived = FALSE
+                            LIMIT 1
+                            """,
+                            (int(link_subject_id), tag_str),
+                        )
+                    row = cur.fetchone()
+                    if not row:
+                        warns.append(f"id={rid}: тег «{tag_str}» не найден в БД — пропуск")
+                        continue
+                    tid = int(row[0])
+                    if source_table == 'skill_defs':
+                        cur.execute(
+                            """
+                            INSERT INTO skill_tags (skill_id, tag_id)
+                            VALUES (%s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (rid, tid),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO content_tags (content_id, tag_id)
+                            VALUES (%s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (rid, tid),
+                        )
+                    ins_cnt += int(cur.rowcount or 0)
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return ins_cnt, warns + [str(e)]
+    return ins_cnt, warns
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_view_data_cached(table: str) -> pd.DataFrame:
     """Загружает skill_defs или content_element_defs с JOIN frp_topics."""
@@ -2440,6 +2647,7 @@ for k, v in [
     ('tag_costs_by_run', {}),
     ('tag_batch_running', False),
     ('tag_batch_stop', False),
+    ('tag_assign_preview', None),
     # --- просмотр базы ---
     ('vdb_type', None),
     ('vdb_reassign', False),
@@ -2465,6 +2673,7 @@ mode = st.radio(
         'llm_structure',  # Структурирование с помощью LLM
         'db_input',       # Добавление в базу данных
         'tagging_init',   # Первичное извлечение тегов
+        'tagging_assign', # Назначение тегов записям (промпт 3)
         'view_db',        # Просмотр базы данных
     ],
     format_func=lambda x: {
@@ -2478,6 +2687,7 @@ mode = st.radio(
         'llm_structure': '🤖 Структурирование с помощью LLM',
         'db_input': '💾 Добавление в базу данных',
         'tagging_init': '🏷️ Тегирование: первичное извлечение',
+        'tagging_assign': '🏷️ Тегирование: назначение тегов',
         'view_db': '📋 Просмотр базы данных',
     }[x],
     horizontal=True,
@@ -6012,6 +6222,243 @@ elif mode == 'tagging_init':
     if st.session_state.get('tag_hierarchy_last'):
         st.markdown("**Структура (до 3 уровней):**")
         st.code("\n".join(st.session_state['tag_hierarchy_last']), language="text")
+
+
+# ============ РЕЖИМ: НАЗНАЧЕНИЕ ТЕГОВ (промпт 3) ============
+elif mode == 'tagging_assign':
+    st.header("🏷️ Назначение тегов записям")
+    st.caption(
+        "По промпту `tag_prompt_3_assign.txt`. Словарь тегов — все канонические строки, "
+        "у которых в **tag_subjects** есть предмет темы из `frp_topics` (не «словарь» tags.subject_id). "
+        "В модель уходит **label_normalized** каждой записи."
+    )
+
+    if not os.environ.get("DATABASE_URL", ""):
+        st.error("DATABASE_URL не задан.")
+        st.stop()
+    if get_db_conn() is None:
+        st.error("Нет подключения к БД.")
+        st.stop()
+
+    _subj_df = load_subjects_cached()
+    if _subj_df.empty:
+        st.error("Таблица subjects недоступна.")
+        st.stop()
+    _as_names = sorted(_subj_df["name"].unique())
+    _as_name_to_id = (
+        _subj_df[["name", "id"]]
+        .drop_duplicates(subset=["name"])
+        .set_index("name")["id"]
+        .to_dict()
+    )
+
+    _a1, _a2 = st.columns([2, 2])
+    with _a1:
+        _as_subj = st.selectbox("Предмет", _as_names, key="assign_sel_subject")
+    with _a2:
+        _as_prog = st.selectbox("Программа", ["базовый", "профильный"], key="assign_sel_program")
+    _as_sid = int(_as_name_to_id[_as_subj])
+
+    _kind = st.radio(
+        "Тип записей",
+        options=["skill_defs", "content_element_defs"],
+        format_func=lambda x: "Навыки (skill_defs)"
+        if x == "skill_defs"
+        else "Элементы содержания (content_element_defs)",
+        horizontal=True,
+        key="assign_kind",
+    )
+
+    def _load_assign_topics_df() -> pd.DataFrame:
+        conn = get_db_conn()
+        if conn is None:
+            return pd.DataFrame()
+        try:
+            df = pd.read_sql(
+                """
+                SELECT f.id, f.grade_class, f.section, f.topic, f.program, f.subject_id,
+                       (SELECT COUNT(*) FROM skill_defs sd WHERE sd.frp_topic_id = f.id) AS skills_cnt,
+                       (SELECT COUNT(*) FROM content_element_defs cd WHERE cd.frp_topic_id = f.id) AS content_cnt
+                FROM frp_topics f
+                WHERE f.subject_id = %s AND f.program = %s
+                ORDER BY
+                  CASE WHEN f.grade_class ~ '^[0-9]+$' THEN f.grade_class::int ELSE 99 END,
+                  f.section, f.topic, f.id
+                """,
+                conn,
+                params=(_as_sid, _as_prog),
+            )
+            conn.close()
+            if df.empty:
+                return df
+            if _kind == "skill_defs":
+                df = df[df["skills_cnt"].fillna(0).astype(int) > 0].reset_index(drop=True)
+            else:
+                df = df[df["content_cnt"].fillna(0).astype(int) > 0].reset_index(drop=True)
+            return df
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return pd.DataFrame()
+
+    _atdf = _load_assign_topics_df()
+    if _atdf.empty:
+        st.warning("Нет тем с записями выбранного типа для этого предмета и программы.")
+        st.stop()
+
+    _gc = st.selectbox(
+        "Класс",
+        sorted(_atdf["grade_class"].unique(), key=lambda x: int(x) if str(x).isdigit() else 99),
+        key="assign_grade",
+    )
+    _sec_df = _atdf[_atdf["grade_class"] == _gc]
+    _sec = st.selectbox("Раздел", sorted(_sec_df["section"].unique()), key="assign_section")
+    _top_df = _sec_df[_sec_df["section"] == _sec]
+    _top = st.selectbox("Тема", sorted(_top_df["topic"].unique()), key="assign_topic")
+    _trow = _top_df[_top_df["topic"] == _top].iloc[0]
+    _frp_tid = int(_trow["id"])
+    _link_sid = (
+        int(_trow["subject_id"])
+        if pd.notna(_trow.get("subject_id")) and _trow.get("subject_id") is not None
+        else _as_sid
+    )
+
+    st.caption(
+        f"Тема **id={_frp_tid}**; для разрешения тегов в БД используется **subject_id={_link_sid}** "
+        f"(предмет темы в `frp_topics`)."
+    )
+
+    _defs_df = load_defs_rows_for_topic_assign(_frp_tid, _kind)
+    if _defs_df.empty:
+        st.warning("В этой теме нет записей с непустым label_normalized.")
+        st.stop()
+
+    _tag_dict = load_tag_dictionary_for_assign(_link_sid)
+    if not _tag_dict:
+        st.error(
+            "Словарь тегов для этого предмета пуст. Нужны канонические теги и строки в **tag_subjects** "
+            "(или без M2M — теги с tags.subject_id = предмету темы)."
+        )
+        st.stop()
+
+    _m1, _m2 = st.columns(2)
+    with _m1:
+        st.metric("Записей к разбору", len(_defs_df))
+    with _m2:
+        st.metric("Тегов в словаре", len(_tag_dict))
+
+    if st.button("Отправить в модель", type="primary", key="assign_run_llm"):
+        _records = [
+            {
+                "source_table": _kind,
+                "id": int(r["id"]),
+                "text": str(r["label_normalized"]).strip(),
+            }
+            for _, r in _defs_df.iterrows()
+        ]
+        _payload = {
+            "subject": _as_subj,
+            "records": _records,
+            "tag_dictionary": _tag_dict,
+        }
+        _prompt = load_tag_prompt(3)
+        _msgs = [
+            {
+                "role": "user",
+                "content": f"{_prompt}\n\nВХОДНЫЕ ДАННЫЕ (JSON):\n{json.dumps(_payload, ensure_ascii=False)}",
+            }
+        ]
+        with st.spinner("Запрос к модели…"):
+            _resp = call_claude_api(_msgs)
+        _parsed = _extract_json_payload(_resp or "")
+        _raw_res = _parsed.get("results") if isinstance(_parsed, dict) else None
+        if not isinstance(_raw_res, list):
+            st.error("Не удалось разобрать ответ модели (ожидается JSON с массивом results).")
+        elif len(_raw_res) != len(_defs_df):
+            st.error(
+                f"Число результатов ({len(_raw_res)}) не совпадает с числом записей ({len(_defs_df)}). "
+                "Повторите запрос."
+            )
+        else:
+            _by_id: Dict[int, Dict] = {}
+            for _r in _raw_res:
+                if not isinstance(_r, dict) or _r.get("id") is None:
+                    continue
+                try:
+                    _by_id[int(_r["id"])] = _r
+                except (TypeError, ValueError):
+                    pass
+            _expected_ids = [int(x) for x in _defs_df["id"].tolist()]
+            _bad = [i for i in _expected_ids if i not in _by_id]
+            if _bad:
+                st.error(f"В ответе нет результатов для id: {_bad[:30]}{'…' if len(_bad) > 30 else ''}")
+            else:
+                _ordered: List[Dict] = []
+                _pre_rows: List[Dict] = []
+                for _, _drow in _defs_df.iterrows():
+                    _rid = int(_drow["id"])
+                    _rrow = dict(_by_id[_rid])
+                    if "new_tags" not in _rrow or not isinstance(_rrow.get("new_tags"), list):
+                        _rrow["new_tags"] = []
+                    if "tags" not in _rrow or not isinstance(_rrow.get("tags"), list):
+                        _rrow["tags"] = []
+                    _ordered.append(_rrow)
+                    _nt = _rrow.get("new_tags") or []
+                    _pre_rows.append(
+                        {
+                            "id": _rid,
+                            "label_normalized": str(_drow.get("label_normalized", "")),
+                            "frp_label": str(_drow.get("frp_label", "") or ""),
+                            "tags": ", ".join(str(t) for t in (_rrow.get("tags") or [])),
+                            "new_tags": ", ".join(str(x) for x in _nt),
+                        }
+                    )
+                st.session_state.tag_assign_preview = {
+                    "link_subject_id": _link_sid,
+                    "source_table": _kind,
+                    "subject_name": _as_subj,
+                    "frp_topic_id": _frp_tid,
+                    "tag_dictionary": list(_tag_dict),
+                    "ordered_results": _ordered,
+                    "preview_rows": _pre_rows,
+                    "record_ids": _expected_ids,
+                }
+                st.success("Ответ модели принят. Проверьте таблицу ниже и нажмите OK для записи в БД.")
+                st.rerun()
+
+    _prev = st.session_state.get("tag_assign_preview")
+    if _prev:
+        if int(_prev.get("frp_topic_id", -1)) != _frp_tid or str(_prev.get("source_table")) != str(_kind):
+            st.info(
+                "Ниже — предпросмотр **предыдущего** прогона (другая тема или тип записей). "
+                "Отправьте запрос снова на текущих фильтрах или нажмите OK, чтобы применить именно этот сохранённый результат."
+            )
+        st.markdown("**Результат (предпросмотр):**")
+        st.dataframe(
+            pd.DataFrame(_prev.get("preview_rows") or []),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "Поле **new_tags** — предложения вне словаря; в БД по OK пишутся только связи "
+            "**skill_tags** / **content_tags** для тегов из словаря (отдельные колонки в skill_defs не нужны)."
+        )
+        if st.button("OK — записать теги в базу", type="primary", key="assign_apply_ok"):
+            _n_ins, _warns = apply_assigned_tags_from_llm(
+                int(_prev["link_subject_id"]),
+                str(_prev["source_table"]),
+                list(_prev["ordered_results"]),
+                list(_prev["tag_dictionary"]),
+            )
+            for _wm in _warns:
+                if _wm:
+                    st.caption(_wm)
+            st.session_state.tag_assign_preview = None
+            load_tag_dictionary_for_assign.clear()
+            st.success(f"Готово: выполнено вставок связей (новых строк): {_n_ins}.")
+            st.rerun()
 
 
 # ============ РЕЖИМ: ПРОСМОТР БАЗЫ ДАННЫХ ============
