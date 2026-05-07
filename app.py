@@ -2756,6 +2756,7 @@ for k, v in [
     ('tag_batch_running', False),
     ('tag_batch_stop', False),
     ('tag_assign_preview', None),
+    ('tag_assign_last_raw_response', None),
     # --- просмотр базы ---
     ('vdb_type', None),
     ('vdb_reassign', False),
@@ -6480,10 +6481,15 @@ elif mode == 'tagging_assign':
         ]
         with st.spinner("Запрос к модели…"):
             _resp = call_claude_api(_msgs)
+        st.session_state.tag_assign_last_raw_response = (
+            _resp if (_resp is not None and str(_resp).strip()) else "(пустой ответ от API)"
+        )
         _parsed = _extract_json_payload(_resp or "")
         if not isinstance(_parsed, dict):
             st.error(
-                "Не удалось извлечь JSON из ответа модели (проверьте, что в ответе есть один объект `{...}`)."
+                "Не удалось вытащить JSON-объект из ответа модели: часто это значит, что в ответе нет целого "
+                "объекта {...} с полем results, JSON обрезан, или модель вернула только текст. "
+                "Разверните ниже блок «Просмотр сырого ответа модели» и посмотрите, что именно пришло."
             )
         else:
             _raw_res = _parsed.get("results")
@@ -6498,8 +6504,10 @@ elif mode == 'tagging_assign':
                     st.caption(_vw)
             if _ordered is None:
                 st.error(
-                    "Ответ модели не прошёл проверку. См. сообщения выше. "
-                    "При необходимости повторите запрос — лишний текст до/после JSON теперь отрезается автоматически."
+                    "Проверка структуры ответа не пройдена: JSON уже разобран, но он не соответствует ожидаемому "
+                    "формату (массив results той же длины, что и записи; у каждого элемента — id, tags и new_tags как "
+                    "массивы; порядок и id совпадают с отправленными записями). Серые подписи выше обычно указывают причину. "
+                    "Сырой текст ответа — в блоке «Просмотр сырого ответа модели» ниже."
                 )
             else:
                 _pre_rows: List[Dict] = []
@@ -6527,6 +6535,19 @@ elif mode == 'tagging_assign':
                 }
                 st.success("Ответ модели принят и проверен. Проверьте таблицу ниже и нажмите OK для записи в БД.")
                 st.rerun()
+
+    _raw_last = st.session_state.get("tag_assign_last_raw_response")
+    if _raw_last is not None:
+        with st.expander("Просмотр сырого ответа модели (последний запрос «Отправить в модель»)", expanded=False):
+            st.caption(
+                "Текст ответа до разбора в приложении. Префиксы/суффиксы вокруг JSON по возможности отрезаются автоматически; "
+                "если ошибка сохраняется, здесь видно, что вернула модель."
+            )
+            _raw_str = str(_raw_last)
+            if len(_raw_str) > 200_000:
+                st.warning(f"Ответ очень длинный ({len(_raw_str)} симв.); показаны первые 200 000.")
+                _raw_str = _raw_str[:200000]
+            st.code(_raw_str, language="text")
 
     _prev = st.session_state.get("tag_assign_preview")
     if _prev:
