@@ -730,13 +730,43 @@ def _strip_thinking_blocks(s: str) -> str:
     return t.strip()
 
 
+def _raw_decode_json_at_first_structure(s: str) -> Optional[object]:
+    """Первый корневой JSON-массив или объект с позиции первого «[» или «{»."""
+    dec = json.JSONDecoder()
+    s = str(s).strip()
+    m = re.search(r"[\[{]", s)
+    if not m:
+        return None
+    try:
+        obj, _end = dec.raw_decode(s, m.start())
+        return obj
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _coerce_assign_like_array_to_results(obj: object) -> Optional[Dict]:
+    """
+    Если модель вернула корнем массив объектов {id, tags, ...} вместо {"results": [...]},
+    приводим к ожидаемому виду для промпта назначения тегов.
+    """
+    if not isinstance(obj, list) or not obj:
+        return None
+    if not all(isinstance(x, dict) for x in obj):
+        return None
+    for x in obj:
+        if "id" not in x or "tags" not in x:
+            return None
+    return {"results": obj}
+
+
 def _extract_json_payload(text: str) -> Optional[Dict]:
     """
     Извлекает JSON-объект из ответа модели и отрезает лишний текст до/после.
     Умеет:
     - снимать ```json fences
-    - отрезать преамбулу до первого «{»
-    - парсить через JSONDecoder.raw_decode (игнорирует хвост после закрывающей «}»)
+    - корневой массив [{...}] для назначения тегов → оборачивает в {"results": [...]}
+    - отрезать преамбулу до первого «{» / «[»
+    - парсить через JSONDecoder.raw_decode (игнорирует хвост после закрывающей скобки JSON)
     - перебирать несколько стартовых «{», если первый — ложный
     - запасной путь: самый большой {...} блок и доп. закрывающие скобки
     """
@@ -756,6 +786,14 @@ def _extract_json_payload(text: str) -> Optional[Dict]:
             t = inner.strip()
         else:
             t = max(parts, key=len).strip()
+
+    # 0) Полный корень: объект или массив (модель часто шлёт [...] без обёртки results)
+    _root = _raw_decode_json_at_first_structure(t)
+    if isinstance(_root, dict):
+        return _root
+    _wrapped = _coerce_assign_like_array_to_results(_root)
+    if isinstance(_wrapped, dict):
+        return _wrapped
 
     def _try_parse(s: str):
         s = s.strip()
@@ -849,8 +887,13 @@ def _validate_and_sanitize_tag_assign_results(
     Возвращает (очищенный список results или None, список предупреждений).
     """
     warns: List[str] = []
+    if raw_results is None:
+        return None, [
+            "В JSON нет массива results (или модель вернула только массив записей без ключа results — "
+            "это должно подхватываться автоматически; проверьте, что ответ — валидный JSON)."
+        ]
     if not isinstance(raw_results, list):
-        return None, ["Поле results не является массивом."]
+        return None, ["Поле results должно быть JSON-массивом (сейчас это не массив)."]
     if len(raw_results) != len(expected_ids):
         return None, [f"Число элементов results ({len(raw_results)}) ≠ числу записей ({len(expected_ids)})."]
 
