@@ -78,6 +78,134 @@ def load_subjects_cached() -> pd.DataFrame:
         return pd.DataFrame(columns=['id', 'name', 'parent_id'])
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_tags_view_by_subject(subject_id: int) -> pd.DataFrame:
+    """
+    Канонические теги, видимые при выборе предмета subject_id:
+    - есть связь в tag_subjects для этого предмета, или
+    - для тега нет ни одной строки tag_subjects (старые данные) и tags.subject_id = subject_id.
+    Алиасы подтягиваются из tag_aliases для строки тега (словарь = tags.subject_id).
+    """
+    conn = get_db_conn()
+    if conn is None:
+        return pd.DataFrame()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = 'public' AND table_name = 'tag_subjects'
+                )
+                """
+            )
+            has_tag_subjects = bool(cur.fetchone()[0])
+        conn.close()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        has_tag_subjects = False
+
+    conn = get_db_conn()
+    if conn is None:
+        return pd.DataFrame()
+
+    base_cols = """
+        t.id AS tag_id,
+        t.tag AS canonical_tag,
+        cs.name AS dictionary_subject,
+        (
+            SELECT string_agg(DISTINCT s2.name, ', ' ORDER BY s2.name)
+            FROM tag_subjects ts3
+            JOIN subjects s2 ON s2.id = ts3.subject_id
+            WHERE ts3.tag_id = t.id
+        ) AS linked_subjects,
+        (
+            SELECT string_agg(ta.alias, ', ' ORDER BY ta.alias)
+            FROM tag_aliases ta
+            WHERE ta.tag_id = t.id AND ta.is_archived = FALSE
+        ) AS aliases,
+        t.is_new,
+        t.reviewed_at,
+        t.created_at,
+        (
+            COALESCE((SELECT COUNT(*)::bigint FROM skill_tags st WHERE st.tag_id = t.id), 0)
+            + COALESCE((SELECT COUNT(*)::bigint FROM content_tags ct WHERE ct.tag_id = t.id), 0)
+        ) AS usage_links
+    """
+
+    if has_tag_subjects:
+        sql = f"""
+            SELECT {base_cols}
+            FROM tags t
+            JOIN subjects cs ON cs.id = t.subject_id
+            WHERE t.is_archived = FALSE
+              AND (
+                EXISTS (
+                  SELECT 1 FROM tag_subjects ts4
+                  WHERE ts4.tag_id = t.id AND ts4.subject_id = %s
+                )
+                OR (
+                  NOT EXISTS (SELECT 1 FROM tag_subjects ts0 WHERE ts0.tag_id = t.id)
+                  AND t.subject_id = %s
+                )
+              )
+            ORDER BY t.tag
+        """
+        params = (int(subject_id), int(subject_id))
+    else:
+        sql = f"""
+            SELECT {base_cols}
+            FROM tags t
+            JOIN subjects cs ON cs.id = t.subject_id
+            WHERE t.is_archived = FALSE AND t.subject_id = %s
+            ORDER BY t.tag
+        """
+        params = (int(subject_id),)
+
+    try:
+        df = pd.read_sql(sql, conn, params=params)
+        conn.close()
+        if df.empty:
+            return df
+        _rev_dt = pd.to_datetime(df['reviewed_at'], errors='coerce')
+        df['status'] = _rev_dt.notna().map({True: 'принят', False: None})
+        df.loc[df['status'].isna() & df['is_new'].astype(bool), 'status'] = 'новый'
+        df['status'] = df['status'].fillna('—')
+        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.strftime('%Y-%m-%d')
+        df['created_at'] = df['created_at'].where(pd.notna(df['created_at']), '—')
+        df['reviewed_at'] = _rev_dt.dt.strftime('%Y-%m-%d')
+        df['reviewed_at'] = df['reviewed_at'].where(pd.notna(df['reviewed_at']), '—')
+        df = df.drop(columns=['is_new'])
+        df.rename(
+            columns={
+                'canonical_tag': 'Канонический тег',
+                'aliases': 'Алиасы',
+                'dictionary_subject': 'Словарь',
+                'linked_subjects': 'Предметы (связи)',
+                'reviewed_at': 'Принят',
+                'created_at': 'Создан',
+                'usage_links': 'Связей с навыками/содержанием',
+                'status': 'Статус',
+            },
+            inplace=True,
+        )
+        df = df.drop(columns=['tag_id'], errors='ignore')
+        for _c in ('Алиасы', 'Предметы (связи)'):
+            if _c in df.columns:
+                df[_c] = df[_c].fillna('—')
+                df.loc[df[_c].astype(str).str.strip() == '', _c] = '—'
+        return df
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_view_data_cached(table: str) -> pd.DataFrame:
     """Загружает skill_defs или content_element_defs с JOIN frp_topics."""
@@ -5697,9 +5825,10 @@ elif mode == 'view_db':
         st.stop()
 
     # ── Выбор типа данных ─────────────────────────────────────────────────────
-    _vt1, _vt2, _ = st.columns([2, 2, 8])
+    _vt1, _vt2, _vt3, _ = st.columns([2, 2, 2, 6])
     _v_skills  = st.session_state.vdb_type == 'skills'
     _v_content = st.session_state.vdb_type == 'content'
+    _v_tags    = st.session_state.vdb_type == 'tags'
     with _vt1:
         if st.button("📚 Навыки", type='primary' if _v_skills else 'secondary',
                      use_container_width=True, key='vdb_tab_skills'):
@@ -5714,9 +5843,63 @@ elif mode == 'view_db':
             st.session_state.vdb_df   = None
             st.session_state.vdb_reassign = False
             st.rerun()
+    with _vt3:
+        if st.button("🏷️ Теги", type='primary' if _v_tags else 'secondary',
+                     use_container_width=True, key='vdb_tab_tags'):
+            st.session_state.vdb_type = 'tags'
+            st.session_state.vdb_df   = None
+            st.session_state.vdb_reassign = False
+            st.rerun()
 
     if not st.session_state.vdb_type:
-        st.info("Выберите тип данных: Навыки или Содержание.")
+        st.info("Выберите тип данных: Навыки, Содержание или Теги.")
+        st.stop()
+
+    # ── Режим: теги (отдельно от skill_defs / content_element_defs) ─────────
+    if st.session_state.vdb_type == 'tags':
+        _subj_df = load_subjects_cached()
+        if _subj_df.empty:
+            st.warning("Не удалось загрузить список предметов (subjects).")
+            st.stop()
+        _tag_subj_names = sorted(_subj_df['name'].unique())
+        _tag_name_to_id = (
+            _subj_df[['name', 'id']]
+            .drop_duplicates(subset=['name'])
+            .set_index('name')['id']
+            .to_dict()
+        )
+        _tc1, _tc2 = st.columns([3, 1])
+        with _tc1:
+            _tag_sel_name = st.selectbox(
+                "Предмет (фильтр по связям)",
+                _tag_subj_names,
+                key='vdb_tags_subject_name',
+            )
+        with _tc2:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if st.button("🔄", key='vdb_tags_reload', help="Обновить список тегов"):
+                load_tags_view_by_subject.clear()
+                st.rerun()
+        _tag_sid = int(_tag_name_to_id[_tag_sel_name])
+        with st.spinner("Загружаю теги…"):
+            _tags_df = load_tags_view_by_subject(_tag_sid)
+        st.caption(
+            "Показываются канонические теги, у которых в **tag_subjects** есть выбранный предмет "
+            "(или тег без таких связей хранится в словаре этого предмета). "
+            "Текст тега всегда из поля **tags.tag**; алиасы — из **tag_aliases**."
+        )
+        if _tags_df.empty:
+            st.info("Для выбранного предмета нет активных тегов (или таблица tags пуста).")
+        else:
+            st.metric("Тегов", len(_tags_df))
+            st.dataframe(
+                _tags_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    'Связей с навыками/содержанием': st.column_config.NumberColumn(format='%d'),
+                },
+            )
         st.stop()
 
     # ── Загрузка данных ───────────────────────────────────────────────────────
