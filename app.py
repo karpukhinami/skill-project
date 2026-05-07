@@ -2382,6 +2382,25 @@ def _accumulate_cost_for_tag_run(run_id: Optional[int]):
 
     st.session_state['_last_claude_usage'] = None
 
+
+def _accumulate_cost_for_tag_assign():
+    """Затраты LLM в режиме «Назначение тегов» (без привязки к tag_extraction_runs)."""
+    usage = st.session_state.get('_last_claude_usage')
+    if not usage:
+        return
+    model_key = usage.get('model_key', st.session_state.get('selected_model_key', 'claude_direct'))
+    prices = _get_model_prices(model_key)
+    in_tok = int(usage.get('input_tokens', 0) or 0)
+    out_tok = int(usage.get('output_tokens', 0) or 0)
+    cost_usd = (in_tok * prices['input'] + out_tok * prices['output']) / 1_000_000
+    prev = st.session_state.get('tag_assign_cost_totals') or {'input_tokens': 0, 'output_tokens': 0, 'usd': 0.0}
+    prev['input_tokens'] = int(prev.get('input_tokens', 0) or 0) + in_tok
+    prev['output_tokens'] = int(prev.get('output_tokens', 0) or 0) + out_tok
+    prev['usd'] = float(prev.get('usd', 0.0) or 0.0) + float(cost_usd)
+    st.session_state['tag_assign_cost_totals'] = prev
+    st.session_state['_last_claude_usage'] = None
+
+
 def group_content_by_structure(data_dict: Dict) -> Dict:
     """Группирует записи содержания по предмету -> класс -> раздел -> тема."""
     grouped = {}
@@ -2722,6 +2741,20 @@ section[data-testid="stSidebar"] div[role="radiogroup"] > label > div[data-basew
             st.metric("Стоимость, USD", f"${_tusd:.4f}")
             st.metric("Стоимость, ₽", f"{_tusd * 90:.2f} ₽")
 
+    # --- Затраты на LLM (назначение тегов записи, промпт 3) ---
+    _ac_tot = st.session_state.get('tag_assign_cost_totals') or {}
+    _acin = int(_ac_tot.get('input_tokens', 0) or 0)
+    _acout = int(_ac_tot.get('output_tokens', 0) or 0)
+    _acusd = float(_ac_tot.get('usd', 0.0) or 0.0)
+    if _acin > 0 or _acout > 0:
+        st.markdown("---")
+        st.markdown("**🏷️💰 Затраты (назначение тегов)**")
+        st.caption(f"Входящие токены: {_acin:,}")
+        st.caption(f"Исходящие токены: {_acout:,}")
+        st.metric("Стоимость, USD", f"${_acusd:.4f}")
+        st.metric("Стоимость, ₽", f"{_acusd * 90:.2f} ₽")
+        st.caption("Сумма за сессию в этом режиме")
+
 # Инициализация session_state
 for k, v in [
     ('mode', 'frp_table'),
@@ -2800,6 +2833,7 @@ for k, v in [
     ('tag_batch_stop', False),
     ('tag_assign_preview', None),
     ('tag_assign_last_raw_response', None),
+    ('tag_assign_cost_totals', {'input_tokens': 0, 'output_tokens': 0, 'usd': 0.0}),
     # --- просмотр базы ---
     ('vdb_type', None),
     ('vdb_reassign', False),
@@ -6524,6 +6558,7 @@ elif mode == 'tagging_assign':
         ]
         with st.spinner("Запрос к модели…"):
             _resp = call_claude_api(_msgs)
+        _accumulate_cost_for_tag_assign()
         st.session_state.tag_assign_last_raw_response = (
             _resp if (_resp is not None and str(_resp).strip()) else "(пустой ответ от API)"
         )
