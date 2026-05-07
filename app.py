@@ -4,6 +4,7 @@
 import pandas as pd
 import json
 import re
+import html as _html
 import io
 import os
 import copy
@@ -204,6 +205,204 @@ def load_tags_view_by_subject(subject_id: int) -> pd.DataFrame:
         except Exception:
             pass
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_promotable_aliases_by_subject(subject_id: int) -> pd.DataFrame:
+    """
+    Активные алиасы, у которых родительский тег виден для subject_id
+    (та же логика фильтра, что и в load_tags_view_by_subject).
+    Колонки: alias_id, alias, tag_id, canonical_tag.
+    """
+    conn = get_db_conn()
+    if conn is None:
+        return pd.DataFrame(columns=['alias_id', 'alias', 'tag_id', 'canonical_tag'])
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = 'public' AND table_name = 'tag_subjects'
+                )
+                """
+            )
+            has_tag_subjects = bool(cur.fetchone()[0])
+        conn.close()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        has_tag_subjects = False
+
+    conn = get_db_conn()
+    if conn is None:
+        return pd.DataFrame(columns=['alias_id', 'alias', 'tag_id', 'canonical_tag'])
+
+    if has_tag_subjects:
+        sql = """
+            SELECT ta.id AS alias_id, ta.alias, t.id AS tag_id, t.tag AS canonical_tag
+            FROM tag_aliases ta
+            JOIN tags t ON t.id = ta.tag_id AND t.subject_id = ta.subject_id
+            WHERE ta.is_archived = FALSE AND t.is_archived = FALSE
+              AND (
+                EXISTS (
+                  SELECT 1 FROM tag_subjects ts4
+                  WHERE ts4.tag_id = t.id AND ts4.subject_id = %s
+                )
+                OR (
+                  NOT EXISTS (SELECT 1 FROM tag_subjects ts0 WHERE ts0.tag_id = t.id)
+                  AND t.subject_id = %s
+                )
+              )
+            ORDER BY t.tag, ta.alias
+        """
+        params = (int(subject_id), int(subject_id))
+    else:
+        sql = """
+            SELECT ta.id AS alias_id, ta.alias, t.id AS tag_id, t.tag AS canonical_tag
+            FROM tag_aliases ta
+            JOIN tags t ON t.id = ta.tag_id AND t.subject_id = ta.subject_id
+            WHERE ta.is_archived = FALSE AND t.is_archived = FALSE
+              AND t.subject_id = %s
+            ORDER BY t.tag, ta.alias
+        """
+        params = (int(subject_id),)
+
+    try:
+        df = pd.read_sql(sql, conn, params=params)
+        conn.close()
+        return df
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return pd.DataFrame(columns=['alias_id', 'alias', 'tag_id', 'canonical_tag'])
+
+
+def promote_tag_aliases_to_canonical(alias_ids: List[int]) -> Tuple[int, List[str]]:
+    """
+    Для каждого alias_id: создаёт (или находит) канонический tags с текстом алиаса
+    в том же словаре (subject_id родителя), копирует tag_subjects с родительского тега,
+    архивирует строку tag_aliases.
+    Возвращает (число успешных, список сообщений).
+    """
+    msgs: List[str] = []
+    if not alias_ids:
+        return 0, msgs
+    conn = get_db_conn()
+    if conn is None:
+        return 0, ["Нет подключения к БД"]
+    ok = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = 'public' AND table_name = 'tag_subjects'
+                )
+                """
+            )
+            _has_tag_subjects = bool(cur.fetchone()[0])
+            for aid in sorted({int(x) for x in alias_ids}):
+                cur.execute(
+                    """
+                    SELECT ta.id, ta.alias, ta.tag_id, t.subject_id, t.tag
+                    FROM tag_aliases ta
+                    JOIN tags t ON t.id = ta.tag_id AND t.subject_id = ta.subject_id
+                    WHERE ta.id = %s AND ta.is_archived = FALSE AND t.is_archived = FALSE
+                    """,
+                    (int(aid),),
+                )
+                row = cur.fetchone()
+                if not row:
+                    msgs.append(f"id={aid}: алиас не найден или уже архивен.")
+                    continue
+                _taid, alias_text, source_tag_id, dict_subject_id, canon_text = (
+                    int(row[0]),
+                    str(row[1]),
+                    int(row[2]),
+                    int(row[3]),
+                    str(row[4]),
+                )
+                a_norm = normalize_db_text(alias_text)
+                c_norm = normalize_db_text(canon_text)
+                if not a_norm:
+                    msgs.append(f"id={aid}: пустой алиас — пропуск.")
+                    continue
+                if a_norm == c_norm:
+                    msgs.append(f"«{alias_text}» совпадает с каноном родителя — пропуск.")
+                    continue
+
+                if _has_tag_subjects:
+                    cur.execute(
+                        "SELECT subject_id FROM tag_subjects WHERE tag_id = %s ORDER BY subject_id",
+                        (int(source_tag_id),),
+                    )
+                    srows = cur.fetchall()
+                    if srows:
+                        subject_ids = [int(r[0]) for r in srows]
+                    else:
+                        subject_ids = [int(dict_subject_id)]
+                else:
+                    subject_ids = [int(dict_subject_id)]
+
+                cur.execute(
+                    """
+                    SELECT id FROM tags
+                    WHERE subject_id = %s AND tag = normalize_term(%s) AND is_archived = FALSE
+                    LIMIT 1
+                    """,
+                    (int(dict_subject_id), alias_text),
+                )
+                ex = cur.fetchone()
+                if ex:
+                    new_tag_id = int(ex[0])
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO tags (subject_id, tag, is_new, is_archived)
+                        VALUES (%s, %s, TRUE, FALSE)
+                        RETURNING id
+                        """,
+                        (int(dict_subject_id), alias_text),
+                    )
+                    new_tag_id = int(cur.fetchone()[0])
+
+                if new_tag_id == source_tag_id:
+                    msgs.append(f"«{alias_text}»: совпадает с id родителя — пропуск.")
+                    continue
+
+                if _has_tag_subjects:
+                    for sid in subject_ids:
+                        cur.execute(
+                            """
+                            INSERT INTO tag_subjects (tag_id, subject_id)
+                            VALUES (%s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (int(new_tag_id), int(sid)),
+                        )
+
+                cur.execute(
+                    "UPDATE tag_aliases SET is_archived = TRUE WHERE id = %s",
+                    (int(aid),),
+                )
+                ok += 1
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return ok, msgs + [str(e)]
+    return ok, msgs
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -5879,6 +6078,7 @@ elif mode == 'view_db':
             st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
             if st.button("🔄", key='vdb_tags_reload', help="Обновить список тегов"):
                 load_tags_view_by_subject.clear()
+                load_promotable_aliases_by_subject.clear()
                 st.rerun()
         _tag_sid = int(_tag_name_to_id[_tag_sel_name])
         with st.spinner("Загружаю теги…"):
@@ -5900,6 +6100,56 @@ elif mode == 'view_db':
                     'Связей с навыками/содержанием': st.column_config.NumberColumn(format='%d'),
                 },
             )
+
+        st.markdown("---")
+        st.subheader("Алиасы → отдельный канонический тег")
+        st.caption(
+            "Канонический тег — подзаголовок, алиасы с отступом. Отметьте галочками и нажмите «Сделать уникальным»: "
+            "для каждого алиаса создаётся свой тег в том же словаре, в **tag_subjects** копируются те же предметы, "
+            "что были у родительского тега; строка алиаса архивируется."
+        )
+        _al_df = load_promotable_aliases_by_subject(_tag_sid)
+        if _al_df.empty:
+            st.info("Нет активных алиасов для этого фильтра предмета.")
+        else:
+            for _, _grp in _al_df.groupby("tag_id", sort=True):
+                _canon = str(_grp.iloc[0]["canonical_tag"])
+                st.markdown(f"##### {_html.escape(_canon)}")
+                for _, _ar in _grp.iterrows():
+                    aid = int(_ar["alias_id"])
+                    atxt = str(_ar["alias"])
+                    _kc1, _kc2 = st.columns([1, 12])
+                    with _kc1:
+                        st.checkbox(
+                            " ",
+                            key=f"vdb_prm_{_tag_sid}_{aid}",
+                            label_visibility="collapsed",
+                        )
+                    with _kc2:
+                        st.markdown(
+                            f'<p style="margin:0 0 0.35em 1.5em;">— {_html.escape(atxt)}</p>',
+                            unsafe_allow_html=True,
+                        )
+
+            if st.button("Сделать уникальным", type="primary", key="vdb_promote_apply"):
+                _picked: List[int] = []
+                for _, _ar in _al_df.iterrows():
+                    aid = int(_ar["alias_id"])
+                    if st.session_state.get(f"vdb_prm_{_tag_sid}_{aid}", False):
+                        _picked.append(aid)
+                if not _picked:
+                    st.warning("Не выбран ни один алиас.")
+                else:
+                    _n_ok, _pmsgs = promote_tag_aliases_to_canonical(_picked)
+                    for _m in _pmsgs:
+                        if _m:
+                            st.caption(_m)
+                    if _n_ok:
+                        st.success(f"Готово: промотнуто алиасов — {_n_ok}.")
+                    load_tags_view_by_subject.clear()
+                    load_promotable_aliases_by_subject.clear()
+                    st.rerun()
+
         st.stop()
 
     # ── Загрузка данных ───────────────────────────────────────────────────────
