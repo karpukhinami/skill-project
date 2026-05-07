@@ -187,39 +187,6 @@ def load_tag_hierarchy_prompt() -> str:
         return ""
 
 
-def _subject_subtree_ids(root_subject_id: int) -> List[int]:
-    """Возвращает root + детей (один уровень) + внуков (ещё один уровень)."""
-    conn = get_db_conn()
-    if conn is None:
-        return [int(root_subject_id)]
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH RECURSIVE tree AS (
-                  SELECT id, parent_id, 0 AS depth
-                  FROM subjects
-                  WHERE id = %s AND is_archived = FALSE
-                  UNION ALL
-                  SELECT s.id, s.parent_id, t.depth + 1
-                  FROM subjects s
-                  JOIN tree t ON s.parent_id = t.id
-                  WHERE s.is_archived = FALSE AND t.depth < 5
-                )
-                SELECT id FROM tree
-                """,
-                (int(root_subject_id),),
-            )
-            ids = [int(r[0]) for r in cur.fetchall()]
-        conn.close()
-        return ids or [int(root_subject_id)]
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return [int(root_subject_id)]
-
 st.set_page_config(page_title="Извлечение ФРП", layout="wide")
 
 # --- Вспомогательные функции для JSON ---
@@ -5093,15 +5060,16 @@ elif mode == 'tagging_init':
         st.warning("Примените миграцию `db/migrations/006_tag_normalization.sql` в Neon SQL Editor, чтобы включить нормализацию и иерархизацию (кнопки ниже неактивны).")
 
     st.caption(
-        "Выберите один или несколько предметов: для каждого берутся он и все потомки в subjects; "
-        "термины из tag_topic_terms объединяются. Канонический словарь (tags / tag_aliases) пишется в выбранный ниже предмет."
+        "Выберите один или несколько предметов: термины из tag_topic_terms "
+        "объединяются только по этим выбранным предметам. "
+        "Канонический словарь (tags / tag_aliases) пишется в выбранный ниже предмет."
     )
 
     _ncol1, _ncol2, _ncol3 = st.columns([4, 2, 6])
     with _ncol1:
         _norm_default = [_sel_subj] if _sel_subj in _subj_names else (_subj_names[:1] if _subj_names else [])
         _norm_root_names = st.multiselect(
-            "Предметы: источник терминов (каждый + дети)",
+            "Предметы: источник терминов",
             options=_subj_names,
             default=_norm_default,
             key='tag_norm_root_subject_names',
@@ -5120,20 +5088,17 @@ elif mode == 'tagging_init':
 
     if not _norm_root_names:
         st.warning("Выберите хотя бы один предмет для сбора терминов из стейджинга.")
-        _staging_union_ids: List[int] = []
+        _staging_subject_ids: List[int] = []
     else:
-        _picked_ids = [int(_subj_name_to_id[n]) for n in _norm_root_names if n in _subj_name_to_id]
-        _staging_union_ids = sorted({sid for rid in _picked_ids for sid in _subject_subtree_ids(rid)})
+        _staging_subject_ids = sorted({int(_subj_name_to_id[n]) for n in _norm_root_names if n in _subj_name_to_id})
 
     _canonical_subject_id = int(_subj_name_to_id.get(_canonical_name))
 
-    def _get_unique_terms_for_subtree(extraction_run_id: Optional[int], subject_ids: List[int]) -> List[Tuple[str, List[int]]]:
+    def _get_unique_terms_for_subjects(subject_ids: List[int]) -> List[Tuple[str, List[int]]]:
         """
-        Возвращает список (term, [subject_id...]) уникальных term_norm в выбранном дереве предметов,
-        только из строк tag_topic_terms, которые ещё не помечены processed_at.
+        Возвращает список (term, [subject_id...]) уникальных term_norm
+        по выбранным предметам из tag_topic_terms.
         """
-        if extraction_run_id is None:
-            return []
         if not subject_ids:
             return []
         conn = get_db_conn()
@@ -5146,13 +5111,11 @@ elif mode == 'tagging_init':
                     SELECT MIN(term) AS term,
                            ARRAY_AGG(DISTINCT subject_id) AS subjects
                     FROM tag_topic_terms
-                    WHERE run_id = %s
-                      AND subject_id = ANY(%s)
-                      AND processed_at IS NULL
+                    WHERE subject_id = ANY(%s)
                     GROUP BY term_norm
                     ORDER BY MIN(term)
                     """,
-                    (int(extraction_run_id), subject_ids),
+                    (subject_ids,),
                 )
                 rows = cur.fetchall()
             conn.close()
@@ -5167,8 +5130,8 @@ elif mode == 'tagging_init':
                 pass
             return []
 
-    _unique_terms = _get_unique_terms_for_subtree(_run_id, _staging_union_ids)
-    st.metric("Уникальных терминов к обработке", len(_unique_terms))
+    _unique_terms = _get_unique_terms_for_subjects(_staging_subject_ids)
+    st.metric("Уникальных формулировок", len(_unique_terms))
 
     st.caption("Если число слишком большое для одного запроса — это нормально: будет чанкование. Прогресс по чанкам сохраняется в БД.")
 
@@ -5273,14 +5236,14 @@ elif mode == 'tagging_init':
         root_subject_id: int,
         syn_run_id: int,
         groups: List[Dict],
-        staging_subject_ids: List[int],
+        selected_subject_ids: List[int],
     ) -> Tuple[int, int]:
         """
         Применяет canonical/aliases:
         - создаёт/находит tags (subject_id = root_subject_id — канонический предмет)
         - создаёт tag_aliases (subject_id = root_subject_id)
         - проставляет tag_subjects по union предметов, где встречались термины
-        - помечает tag_topic_terms.processed_at/processed_run_id для термов группы в staging_subject_ids
+        - помечает tag_topic_terms.processed_at/processed_run_id для термов группы в selected_subject_ids
 
         Возвращает (created_tags_cnt, created_aliases_cnt)
         """
@@ -5354,12 +5317,11 @@ elif mode == 'tagging_init':
                         """
                         UPDATE tag_topic_terms
                         SET processed_at = COALESCE(processed_at, now()),
-                            processed_run_id = %s
-                        WHERE run_id = %s
-                          AND subject_id = ANY(%s)
+                            processed_run_id = COALESCE(processed_run_id, %s)
+                        WHERE subject_id = ANY(%s)
                           AND term_norm = normalize_term(%s)
                         """,
-                        (int(syn_run_id), int(_run_id), staging_subject_ids, term),
+                        (int(syn_run_id), selected_subject_ids, term),
                     )
 
         conn.commit()
@@ -5573,7 +5535,7 @@ elif mode == 'tagging_init':
                     raise RuntimeError("Пустой canonical")
 
                 if _phase == 'chunk':
-                    created_tags, created_aliases = _apply_synonyms(_canonical_subject_id, _syn_id, groups, _staging_union_ids)
+                    created_tags, created_aliases = _apply_synonyms(_canonical_subject_id, _syn_id, groups, _staging_subject_ids)
                 else:
                     archived = _merge_canonicals(_canonical_subject_id, groups)
                     created_tags, created_aliases = 0, 0
