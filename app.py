@@ -612,6 +612,277 @@ def apply_assigned_tags_from_llm(
     return ins_cnt, warns
 
 
+def load_tags_review_list(link_subject_id: int) -> List[Dict]:
+    """
+    Канонические теги, видимые для предмета связей (как в просмотре тегов).
+    Каждый элемент: id, tag, dict_subject_id, is_new, reviewed_at, aliases: [{id, alias}, ...].
+    """
+    conn = get_db_conn()
+    if conn is None:
+        return []
+    out: List[Dict] = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = 'public' AND table_name = 'tag_subjects'
+                )
+                """
+            )
+            has_ts = bool(cur.fetchone()[0])
+            if has_ts:
+                cur.execute(
+                    """
+                    SELECT t.id, t.tag, t.subject_id, t.is_new, t.reviewed_at
+                    FROM tags t
+                    WHERE t.is_archived = FALSE
+                      AND (
+                        EXISTS (
+                          SELECT 1 FROM tag_subjects ts
+                          WHERE ts.tag_id = t.id AND ts.subject_id = %s
+                        )
+                        OR (
+                          NOT EXISTS (SELECT 1 FROM tag_subjects ts0 WHERE ts0.tag_id = t.id)
+                          AND t.subject_id = %s
+                        )
+                      )
+                    ORDER BY t.tag
+                    """,
+                    (int(link_subject_id), int(link_subject_id)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT t.id, t.tag, t.subject_id, t.is_new, t.reviewed_at
+                    FROM tags t
+                    WHERE t.is_archived = FALSE AND t.subject_id = %s
+                    ORDER BY t.tag
+                    """,
+                    (int(link_subject_id),),
+                )
+            tag_rows = cur.fetchall()
+            for tid, tag, dsid, is_new, rev_at in tag_rows:
+                cur.execute(
+                    """
+                    SELECT id, alias FROM tag_aliases
+                    WHERE tag_id = %s AND is_archived = FALSE
+                    ORDER BY alias
+                    """,
+                    (int(tid),),
+                )
+                al_rows = cur.fetchall()
+                aliases = [{"id": int(a[0]), "alias": str(a[1])} for a in al_rows]
+                out.append(
+                    {
+                        "id": int(tid),
+                        "tag": str(tag),
+                        "dict_subject_id": int(dsid),
+                        "is_new": bool(is_new),
+                        "reviewed_at": rev_at,
+                        "aliases": aliases,
+                    }
+                )
+        conn.close()
+        return out
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return []
+
+
+def tag_review_update_canonical(tag_id: int, new_text: str) -> Optional[str]:
+    if not normalize_db_text(new_text):
+        return "Пустая формулировка."
+    conn = get_db_conn()
+    if conn is None:
+        return "Нет подключения к БД."
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT is_new FROM tags WHERE id = %s AND is_archived = FALSE", (int(tag_id),))
+            row = cur.fetchone()
+            if not row:
+                return "Тег не найден."
+            if not bool(row[0]):
+                return "Принятый тег (is_new=false) нельзя переименовать."
+            cur.execute(
+                "UPDATE tags SET tag = %s WHERE id = %s AND is_archived = FALSE",
+                (str(new_text).strip(), int(tag_id)),
+            )
+        conn.commit()
+        conn.close()
+        return None
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return str(e)
+
+
+def tag_review_add_alias(tag_id: int, alias_text: str) -> Optional[str]:
+    if not normalize_db_text(alias_text):
+        return "Пустой алиас."
+    conn = get_db_conn()
+    if conn is None:
+        return "Нет подключения к БД."
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT subject_id FROM tags WHERE id = %s AND is_archived = FALSE",
+                (int(tag_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return "Тег не найден."
+            dsid = int(row[0])
+            cur.execute(
+                """
+                INSERT INTO tag_aliases (subject_id, alias, tag_id, is_archived)
+                VALUES (%s, %s, %s, FALSE)
+                """,
+                (dsid, str(alias_text).strip(), int(tag_id)),
+            )
+        conn.commit()
+        conn.close()
+        return None
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return str(e)
+
+
+def tag_review_swap_canonical_with_alias(tag_id: int, alias_row_id: int) -> Optional[str]:
+    conn = get_db_conn()
+    if conn is None:
+        return "Нет подключения к БД."
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT tag, is_new FROM tags WHERE id = %s AND is_archived = FALSE",
+                (int(tag_id),),
+            )
+            trow = cur.fetchone()
+            if not trow:
+                return "Тег не найден."
+            old_canon = str(trow[0])
+            if not bool(trow[1]):
+                return "Принятый тег нельзя менять местами с алиасом."
+            cur.execute(
+                """
+                SELECT id, alias FROM tag_aliases
+                WHERE id = %s AND tag_id = %s AND is_archived = FALSE
+                """,
+                (int(alias_row_id), int(tag_id)),
+            )
+            arow = cur.fetchone()
+            if not arow:
+                return "Алиас не найден."
+            alias_text = str(arow[1])
+            if normalize_db_text(old_canon) == normalize_db_text(alias_text):
+                return "Канон и алиас совпадают после нормализации."
+            cur.execute(
+                "UPDATE tags SET tag = %s WHERE id = %s",
+                (alias_text, int(tag_id)),
+            )
+            cur.execute(
+                "UPDATE tag_aliases SET alias = %s WHERE id = %s",
+                (old_canon, int(alias_row_id)),
+            )
+        conn.commit()
+        conn.close()
+        return None
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return str(e)
+
+
+def tag_review_create_tag(dict_subject_id: int, tag_text: str, link_subject_id: int) -> Optional[str]:
+    if not normalize_db_text(tag_text):
+        return "Пустая формулировка тега."
+    conn = get_db_conn()
+    if conn is None:
+        return "Нет подключения к БД."
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM tags
+                WHERE subject_id = %s AND tag = normalize_term(%s) AND is_archived = FALSE
+                LIMIT 1
+                """,
+                (int(dict_subject_id), str(tag_text).strip()),
+            )
+            if cur.fetchone():
+                return "Такой канонический тег уже есть в этом словаре."
+            cur.execute(
+                """
+                INSERT INTO tags (subject_id, tag, is_new, is_archived)
+                VALUES (%s, %s, TRUE, FALSE)
+                RETURNING id
+                """,
+                (int(dict_subject_id), str(tag_text).strip()),
+            )
+            new_id = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                INSERT INTO tag_subjects (tag_id, subject_id)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (new_id, int(link_subject_id)),
+            )
+        conn.commit()
+        conn.close()
+        return None
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return str(e)
+
+
+def tag_review_accept_tags(tag_ids: List[int]) -> Optional[str]:
+    if not tag_ids:
+        return "Не выбрано ни одного тега."
+    conn = get_db_conn()
+    if conn is None:
+        return "Нет подключения к БД."
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tags
+                SET is_new = FALSE, reviewed_at = now()
+                WHERE id = ANY(%s) AND is_archived = FALSE
+                """,
+                (list({int(x) for x in tag_ids}),),
+            )
+        conn.commit()
+        conn.close()
+        return None
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return str(e)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_view_data_cached(table: str) -> pd.DataFrame:
     """Загружает skill_defs или content_element_defs с JOIN frp_topics."""
@@ -2839,6 +3110,7 @@ for k, v in [
     ('vdb_reassign', False),
     ('vdb_df', None),
     ('vdb_grp_map', {}),
+    ('tag_rev_nonce', 0),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -2860,6 +3132,7 @@ mode = st.radio(
         'db_input',       # Добавление в базу данных
         'tagging_init',   # Первичное извлечение тегов
         'tagging_assign', # Назначение тегов записям (промпт 3)
+        'tagging_review', # Ревью и правка канонических тегов
         'view_db',        # Просмотр базы данных
     ],
     format_func=lambda x: {
@@ -2874,6 +3147,7 @@ mode = st.radio(
         'db_input': '💾 Добавление в базу данных',
         'tagging_init': '🏷️ Тегирование: первичное извлечение',
         'tagging_assign': '🏷️ Тегирование: назначение тегов',
+        'tagging_review': '✅ Ревью тегов',
         'view_db': '📋 Просмотр базы данных',
     }[x],
     horizontal=True,
@@ -6588,15 +6862,12 @@ elif mode == 'tagging_assign':
                     "Сырой текст ответа — в блоке «Просмотр сырого ответа модели» ниже."
                 )
             else:
-                _pre_rows: List[Dict] = []
+                _editable_rows: List[Dict] = []
                 for (_, _drow), _rrow in zip(_defs_df.iterrows(), _ordered):
-                    _rid = int(_drow["id"])
                     _nt = _rrow.get("new_tags") or []
-                    _pre_rows.append(
+                    _editable_rows.append(
                         {
-                            "id": _rid,
-                            "label_normalized": str(_drow.get("label_normalized", "")),
-                            "frp_label": str(_drow.get("frp_label", "") or ""),
+                            "label_display": str(_drow.get("label_normalized", "")),
                             "tags": ", ".join(str(t) for t in (_rrow.get("tags") or [])),
                             "new_tags": ", ".join(str(x) for x in _nt),
                         }
@@ -6608,7 +6879,7 @@ elif mode == 'tagging_assign':
                     "frp_topic_id": _frp_tid,
                     "tag_dictionary": list(_tag_dict),
                     "ordered_results": _ordered,
-                    "preview_rows": _pre_rows,
+                    "editable_rows": _editable_rows,
                     "record_ids": _expected_ids,
                 }
                 st.success("Ответ модели принят и проверен. Проверьте таблицу ниже и нажмите OK для записи в БД.")
@@ -6634,21 +6905,65 @@ elif mode == 'tagging_assign':
                 "Ниже — предпросмотр **предыдущего** прогона (другая тема или тип записей). "
                 "Отправьте запрос снова на текущих фильтрах или нажмите OK, чтобы применить именно этот сохранённый результат."
             )
-        st.markdown("**Результат (предпросмотр):**")
-        st.dataframe(
-            pd.DataFrame(_prev.get("preview_rows") or []),
+        st.markdown("**Результат (предпросмотр, можно править):**")
+        _erows = _prev.get("editable_rows")
+        if not _erows and _prev.get("preview_rows"):
+            _erows = [
+                {
+                    "label_display": str(r.get("label_normalized", "")),
+                    "tags": str(r.get("tags", "")),
+                    "new_tags": str(r.get("new_tags", "")),
+                }
+                for r in (_prev.get("preview_rows") or [])
+            ]
+        _edf = pd.DataFrame(_erows or [])
+        _edited_assign = st.data_editor(
+            _edf,
             use_container_width=True,
             hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "label_display": st.column_config.TextColumn(
+                    "Формулировка (label_display)",
+                    disabled=True,
+                    help="Текст из label_normalized, только для ориентира.",
+                ),
+                "tags": st.column_config.TextColumn(
+                    "Теги",
+                    help="Через запятую; в БД попадут только теги из словаря.",
+                ),
+                "new_tags": st.column_config.TextColumn(
+                    "Новые теги",
+                    help="Через запятую; для справки, в skill_tags/content_tags не пишутся.",
+                ),
+            },
+            key="tag_assign_preview_editor",
         )
         st.caption(
-            "Поле **new_tags** — предложения вне словаря; в БД по OK пишутся только связи "
-            "**skill_tags** / **content_tags** для тегов из словаря (отдельные колонки в skill_defs не нужны)."
+            "Колонка **Новые теги** редактируется вручную (добавить или убрать предложения модели). "
+            "В БД по OK пишутся только связи **skill_tags** / **content_tags** для тегов из словаря."
         )
         if st.button("OK — записать теги в базу", type="primary", key="assign_apply_ok"):
+            _rid_list = list(_prev.get("record_ids") or [])
+            _new_ordered: List[Dict] = []
+            for i, rid in enumerate(_rid_list):
+                if i >= len(_edited_assign):
+                    break
+                _row = _edited_assign.iloc[i]
+                _tags_list = [x.strip() for x in str(_row.get("tags", "")).split(",") if x.strip()]
+                _nt_list = [x.strip() for x in str(_row.get("new_tags", "")).split(",") if x.strip()]
+                _new_ordered.append(
+                    {
+                        "source_table": str(_prev["source_table"]),
+                        "id": int(rid),
+                        "tags": _tags_list,
+                        "new_tags": _nt_list,
+                    }
+                )
             _n_ins, _warns = apply_assigned_tags_from_llm(
                 int(_prev["link_subject_id"]),
                 str(_prev["source_table"]),
-                list(_prev["ordered_results"]),
+                _new_ordered,
                 list(_prev["tag_dictionary"]),
             )
             for _wm in _warns:
@@ -6657,6 +6972,236 @@ elif mode == 'tagging_assign':
             st.session_state.tag_assign_preview = None
             load_tag_dictionary_for_assign.clear()
             st.success(f"Готово: выполнено вставок связей (новых строк): {_n_ins}.")
+            st.rerun()
+
+
+# ============ РЕЖИМ: РЕВЬЮ ТЕГОВ ============
+elif mode == "tagging_review":
+    st.header("✅ Ревью канонических тегов")
+    st.caption(
+        "Список тегов для выбранного предмета совпадает с логикой просмотра: **tag_subjects** "
+        "(и запасной вариант — только словарь `tags.subject_id`). "
+        "Уже **принятые** теги (`is_new=false`) нельзя переименовать и нельзя обменять с алиасом — так устроены ограничения в БД."
+    )
+    _rv_flash_errs = st.session_state.pop("tag_rev_canon_flash_errs", None)
+    if _rv_flash_errs:
+        for _fe in _rv_flash_errs[:20]:
+            st.error(_fe)
+    if st.session_state.pop("tag_rev_canon_flash_ok", False):
+        st.success("Канон обновлён (где это было разрешено).")
+
+    if not os.environ.get("DATABASE_URL", ""):
+        st.error("DATABASE_URL не задан.")
+        st.stop()
+    if get_db_conn() is None:
+        st.error("Нет подключения к БД.")
+        st.stop()
+
+    _subj_df = load_subjects_cached()
+    if _subj_df.empty:
+        st.error("Таблица subjects недоступна.")
+        st.stop()
+    _rv_names = sorted(_subj_df["name"].unique())
+    _rv_name_to_id = (
+        _subj_df[["name", "id"]]
+        .drop_duplicates(subset=["name"])
+        .set_index("name")["id"]
+        .to_dict()
+    )
+    _rv_id_to_name = (
+        _subj_df[["id", "name"]]
+        .drop_duplicates(subset=["id"])
+        .set_index("id")["name"]
+        .to_dict()
+    )
+
+    _rc1, _rc2 = st.columns([4, 1])
+    with _rc1:
+        _rv_sub = st.selectbox("Предмет (фильтр по связям)", _rv_names, key="tag_rev_subject_name")
+    with _rc2:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if st.button("🔄 Обновить из БД", key="tag_rev_reload_db"):
+            st.session_state.tag_rev_nonce = int(st.session_state.get("tag_rev_nonce", 0)) + 1
+            st.rerun()
+
+    _rv_link_sid = int(_rv_name_to_id[_rv_sub])
+    _rv_rows = load_tags_review_list(_rv_link_sid)
+    if not _rv_rows:
+        st.info("Нет канонических тегов для выбранного предмета.")
+        st.stop()
+
+    _dict_ids = sorted({int(r["dict_subject_id"]) for r in _rv_rows})
+    if len(_dict_ids) == 1:
+        _dict_pick = _dict_ids[0]
+        st.caption(
+            f"Новые теги создаются в словаре **{_rv_id_to_name.get(_dict_pick, str(_dict_pick))}** (`subject_id={_dict_pick}`)."
+        )
+    else:
+        _dict_pick = int(
+            st.selectbox(
+                "Словарь для новых тегов (`tags.subject_id`)",
+                options=_dict_ids,
+                format_func=lambda i: f"{_rv_id_to_name.get(i, '?')} (id={i})",
+                key="tag_rev_dict_subject_pick",
+            )
+        )
+
+    _rb1, _rb2, _ = st.columns([2, 2, 6])
+    with _rb1:
+        if st.button("☑ Выделить всё", key="tag_rev_mark_all"):
+            st.session_state.tag_rev_check_all = True
+            st.session_state.tag_rev_nonce = int(st.session_state.get("tag_rev_nonce", 0)) + 1
+            st.rerun()
+    with _rb2:
+        if st.button("☐ Снять выделение", key="tag_rev_mark_none"):
+            st.session_state.tag_rev_uncheck_all = True
+            st.session_state.tag_rev_nonce = int(st.session_state.get("tag_rev_nonce", 0)) + 1
+            st.rerun()
+
+    _rv_table_rows: List[Dict] = []
+    for _r in _rv_rows:
+        _rv_ra = _r.get("reviewed_at")
+        if _rv_ra is not None and not pd.isna(_rv_ra):
+            try:
+                _rv_ra_s = str(pd.Timestamp(_rv_ra).date())
+            except Exception:
+                _rv_ra_s = str(_rv_ra)[:10]
+        else:
+            _rv_ra_s = "—"
+        _rv_st = "принят" if not _r["is_new"] else "новый"
+        _rv_table_rows.append(
+            {
+                "id": int(_r["id"]),
+                "Принять": False,
+                "Канон": str(_r["tag"]),
+                "Алиасы": ", ".join(a["alias"] for a in _r["aliases"]),
+                "Статус": f"{_rv_st} ({_rv_ra_s})",
+            }
+        )
+    _rv_df = pd.DataFrame(_rv_table_rows)
+    if st.session_state.pop("tag_rev_check_all", False):
+        _rv_df["Принять"] = True
+    if st.session_state.pop("tag_rev_uncheck_all", False):
+        _rv_df["Принять"] = False
+
+    _rv_nonce = int(st.session_state.get("tag_rev_nonce", 0))
+    _rv_edited = st.data_editor(
+        _rv_df,
+        key=f"tag_rev_editor_{_rv_link_sid}_{_rv_nonce}",
+        hide_index=True,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "id": st.column_config.NumberColumn("id", disabled=True, format="%d", width="small"),
+            "Алиасы": st.column_config.TextColumn(disabled=True),
+            "Статус": st.column_config.TextColumn(disabled=True),
+            "Канон": st.column_config.TextColumn(
+                help="Для уже принятых тегов переименование заблокировано в БД.",
+            ),
+            "Принять": st.column_config.CheckboxColumn(
+                help="Отметьте и нажмите «Принять выбранные» внизу таблицы.",
+                default=False,
+            ),
+        },
+    )
+
+    if st.button("Сохранить изменения «Канон»", key="tag_rev_save_canonical"):
+        _errs: List[str] = []
+        for _i, _orig in enumerate(_rv_rows):
+            _er = _rv_edited.iloc[_i]
+            if str(_er["Канон"]).strip() != str(_orig["tag"]):
+                _m = tag_review_update_canonical(int(_er["id"]), str(_er["Канон"]))
+                if _m:
+                    _errs.append(f"id {_er['id']}: {_m}")
+        load_tags_view_by_subject.clear()
+        load_promotable_aliases_by_subject.clear()
+        load_tag_dictionary_for_assign.clear()
+        st.session_state.tag_rev_canon_flash_errs = _errs if _errs else None
+        st.session_state.tag_rev_canon_flash_ok = not bool(_errs)
+        st.session_state.tag_rev_nonce = _rv_nonce + 1
+        st.rerun()
+
+    _rv_accept_ids = [
+        int(_rv_edited.iloc[i]["id"])
+        for i in range(len(_rv_edited))
+        if bool(_rv_edited.iloc[i].get("Принять"))
+    ]
+    if st.button("Принять выбранные", type="primary", key="tag_rev_accept_marked"):
+        if not _rv_accept_ids:
+            st.warning("Отметьте хотя бы один тег в колонке «Принять».")
+        else:
+            _am = tag_review_accept_tags(_rv_accept_ids)
+            if _am:
+                st.error(_am)
+            else:
+                load_tags_view_by_subject.clear()
+                load_promotable_aliases_by_subject.clear()
+                load_tag_dictionary_for_assign.clear()
+                st.session_state.tag_rev_nonce = _rv_nonce + 1
+                st.success(f"Принято тегов: {len(_rv_accept_ids)}.")
+                st.rerun()
+
+    st.markdown("---")
+    st.subheader("Алиасы и новый канонический тег")
+    _op_ids = [int(r["id"]) for r in _rv_rows]
+    _op_lbl = {int(r["id"]): str(r["tag"]) for r in _rv_rows}
+    _op_sel = st.selectbox(
+        "Тег для операции",
+        options=_op_ids,
+        format_func=lambda tid: f"{tid} — {_op_lbl.get(tid, '')}",
+        key="tag_rev_op_tag_id",
+    )
+    _op_aliases = next(r["aliases"] for r in _rv_rows if int(r["id"]) == int(_op_sel))
+
+    _oc1, _oc2 = st.columns(2)
+    with _oc1:
+        _in_al = st.text_input("Новый алиас (ручной ввод)", key="tag_rev_manual_alias")
+        if st.button("Добавить алиас", key="tag_rev_do_add_alias"):
+            _em = tag_review_add_alias(int(_op_sel), _in_al)
+            if _em:
+                st.error(_em)
+            else:
+                load_tags_view_by_subject.clear()
+                load_promotable_aliases_by_subject.clear()
+                load_tag_dictionary_for_assign.clear()
+                st.session_state.tag_rev_nonce = _rv_nonce + 1
+                st.success("Алиас добавлен.")
+                st.rerun()
+    with _oc2:
+        if _op_aliases:
+            _sw_ids = [int(a["id"]) for a in _op_aliases]
+            _sw_map = {int(a["id"]): str(a["alias"]) for a in _op_aliases}
+            _sw_pick = st.selectbox(
+                "Поменять местами с алиасом",
+                options=_sw_ids,
+                format_func=lambda aid: _sw_map.get(int(aid), ""),
+                key="tag_rev_swap_alias_id",
+            )
+            if st.button("Поменять канон ↔ алиас", key="tag_rev_do_swap"):
+                _sm = tag_review_swap_canonical_with_alias(int(_op_sel), int(_sw_pick))
+                if _sm:
+                    st.error(_sm)
+                else:
+                    load_tags_view_by_subject.clear()
+                    load_promotable_aliases_by_subject.clear()
+                    load_tag_dictionary_for_assign.clear()
+                    st.session_state.tag_rev_nonce = _rv_nonce + 1
+                    st.success("Канон и алиас поменялись местами.")
+                    st.rerun()
+        else:
+            st.caption("У этого тега нет алиасов для обмена.")
+
+    _new_canon = st.text_input("Новый канонический тег", key="tag_rev_new_canonical_text")
+    if st.button("Создать тег", key="tag_rev_do_create_tag"):
+        _cm = tag_review_create_tag(int(_dict_pick), _new_canon, _rv_link_sid)
+        if _cm:
+            st.error(_cm)
+        else:
+            load_tags_view_by_subject.clear()
+            load_promotable_aliases_by_subject.clear()
+            load_tag_dictionary_for_assign.clear()
+            st.session_state.tag_rev_nonce = _rv_nonce + 1
+            st.success("Тег создан и привязан к предмету фильтра в tag_subjects.")
             st.rerun()
 
 
